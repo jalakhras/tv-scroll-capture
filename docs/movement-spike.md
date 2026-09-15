@@ -85,3 +85,14 @@ The warning sequence in the owner's result ("Vertical tracking: weak match" foll
 Verified on BITSTAMP:BTCUSD 15m, dark theme, DPR 1.25, Pivot labels, price window narrowed
 to 35 % of the auto range: 8 steps / 19 frames / 6811×1683 px, no warnings. Bar Replay itself
 is still untested (not available to anonymous sessions).
+
+## Follow-up (v1.3.3, capturing from the oldest point toward present)
+
+`scrollChartByBar` happily scrolls past the last bar (rightOffset > 0) and, once history is
+exhausted, past the first one; the frames then get emptier until a match fails with a misleading
+"weak match". Horizontal moves are now clamped at the data edges from the model
+(`bars().firstIndex()` + `endOfData()` on the left, `rightOffset` on the right, `END_GAP = 3`
+bars kept after the last candle) and the run ends with `wEndReached`. Verified: BTCUSD 1h from
+~1200 bars back toward present (30 frames, ends 3 bars after the last candle) and ARM 1D into
+the past down to the IPO bar (8 frames). `visibleBarsStrictRange()` returns *logical* indices,
+so it cannot be used to detect the edge by itself.

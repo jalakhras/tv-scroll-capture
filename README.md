@@ -25,8 +25,11 @@ better than a wrong one). A CDP mouse-drag fallback is used on pages without the
 ## Use
 
 * **Auto scroll** — pick the direction (into the past / toward present), the number of steps
-  and the step length. The extension scrolls, captures and stitches; it stops at the end of the
-  data, at Chrome's canvas limit (32000 px), or on the first frame it cannot verify.
+  and the step length. The extension scrolls, captures and stitches; it stops exactly at the
+  first or last bar, at Chrome's canvas limit (32000 px), or on the first frame it cannot verify.
+  Recommended workflow for a whole history: scroll the chart manually to the oldest point you
+  want, then run **toward present** with a large number of steps — it ends by itself at the
+  last candle.
 * **Manual capture** — press start, then move the chart yourself (arrow keys work best);
   press the button again or `Alt+Shift+S` to stop and save.
 * **Vertical tracking** — candles that leave the pane top/bottom are followed automatically;
@@ -80,8 +83,9 @@ the v1.3 design. Run `node --check *.js` before committing.
 ## الاستخدام
 
 * **التمرير الآلي** — اختر الاتجاه (نحو الماضي / نحو الحاضر) وعدد الخطوات وطول الخطوة.
-  تمرّر الإضافة وتلتقط وتدمج، وتتوقف عند نهاية البيانات أو حد Chrome (32000px) أو عند أول
-  إطار يتعذّر التحقق منه.
+  تمرّر الإضافة وتلتقط وتدمج، وتتوقف بدقة عند أول شمعة أو آخرها، أو عند حد Chrome (32000px)،
+  أو عند أول إطار يتعذّر التحقق منه. الطريقة الموصى بها لتاريخ كامل: حرّك الشارت يدوياً إلى أقدم
+  نقطة تريدها، ثم شغّل **نحو الحاضر** بعدد خطوات كبير — يتوقف وحده عند آخر شمعة.
 * **الالتقاط اليدوي** — اضغط البدء ثم حرّك الشارت بنفسك (الأسهم أفضل)، وللإيقاف أعد الضغط
   أو `Alt+Shift+S`.
 * **التتبّع العمودي** — الشموع الخارجة أعلى أو أسفل اللوحة تُتابَع تلقائياً؛ الصورة تكبر

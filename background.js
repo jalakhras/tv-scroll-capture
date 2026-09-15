@@ -186,11 +186,13 @@ function pageApi(cmd, a) {
       try { const br = model.timeScale().visibleBarsStrictRange(); if (br) bars = { first: br.firstBar(), last: br.lastBar() }; } catch {}
       try { loading = chart.getSeries().isLoading(); } catch {}
       try { endOfData = series.endOfData(); } catch {}
+      let firstIndex = null, lastIndex = null;
+      try { const bb = series.bars(); firstIndex = bb.firstIndex(); lastIndex = bb.lastIndex(); } catch {}
       return {
         ok: true, barSpacing: ts.barSpacing(), rightOffset: ts.rightOffset(), auto: ps.isAutoScale(),
         price: r, top: r ? ps.priceToCoordinate(r.to) : null, bottom: r ? ps.priceToCoordinate(r.from) : null,
         paneH: pane.getHeight(), mode: ps.getMode(), locked: ps.isLocked(), ratioLocked: chart.isPriceToBarRatioLocked(),
-        panes: panes.length, bars, loading, endOfData,
+        panes: panes.length, bars, loading, endOfData, firstIndex, lastIndex,
         symbol: (() => { try { return chart.symbol(); } catch { return null; } })(),
         resolution: (() => { try { return chart.resolution(); } catch { return null; } })(),
       };
@@ -989,6 +991,8 @@ async function run(mode, tabId, overrides) {
     const hideRect = { x: P.x, y: P.y, w: P.w, h: L.bottom - P.y };
     const parkMouse = () => cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 });
     let hideLogged = false;
+    const END_GAP = 3; // bars of empty space kept after the last candle when capturing toward present
+    let edgeHit = false; // set by move() when a horizontal move was clamped at a data edge
     const prep = async () => {
       if (!opts.hideOverlays) return;
       const r = await exec(tabId, pageHideOverlays, [hideRect, !!dbg && !hideLogged]);
@@ -1020,10 +1024,19 @@ async function run(mode, tabId, overrides) {
       if (useApi) {
         let ax = 0, ay = 0;
         if (dx) {
-          const n = Math.max(1, Math.round(Math.abs(dx) / probe.barSpacing)) * Math.sign(dx);
+          let n = Math.max(1, Math.round(Math.abs(dx) / probe.barSpacing)) * Math.sign(dx);
+          // Clamp at the data edges: stop exactly at the first bar (into the past, once history
+          // is exhausted) or END_GAP bars after the last bar (toward present).
+          const p0 = await apiProbe();
+          if (p0 && p0.ok && p0.bars) {
+            if (n > 0 && p0.endOfData && p0.firstIndex !== null) n = Math.min(n, Math.max(0, p0.bars.first - p0.firstIndex));
+            if (n < 0) n = -Math.min(-n, Math.max(0, END_GAP - p0.rightOffset));
+          }
+          if (n === 0) { edgeHit = true; return { dx: 0, dy: 0 }; }
           const r = await execMain(tabId, pageApi, ['scrollBars', { n }]);
           ax = n * (r && r.barSpacing || probe.barSpacing);
-          dlog('api', { cmd: 'scrollBars', n, result: r, frame: dbg ? await exec(tabId, pageFrameProbe) : null });
+          if (r && r.ok) edgeHit = (n > 0 && p0 && p0.endOfData && r.bars && r.bars.first <= (p0.firstIndex ?? -Infinity)) || (n < 0 && r.rightOffset >= END_GAP - 0.5);
+          dlog('api', { cmd: 'scrollBars', n, result: r, edgeHit, frame: dbg ? await exec(tabId, pageFrameProbe) : null });
         }
         if (dy) {
           const r = await execMain(tabId, pageApi, ['shiftPx', { dy }]);
@@ -1227,6 +1240,7 @@ async function run(mode, tabId, overrides) {
         setStatus('stStep', { i, n: opts.steps });
         if (!(await ensureOverlapVisible())) break;
         const req = await move(dir * stepCss, 0);
+        if (useApi && req.dx === 0) { warn('end', 'wEndReached'); break; }
         await settle();
         const exp = req.dx * k;
         const span = useApi ? Math.abs(exp) * 0.1 + 8 * k : Math.abs(exp) * 0.5 + 20 * k;
@@ -1260,7 +1274,7 @@ async function run(mode, tabId, overrides) {
                          : { first: Math.max(p2.bars.first, lastBars.last + 1), last: p2.bars.last })
               : p2.bars;
             // Reached the first bar (or the realtime edge): finish after this frame.
-            atEnd = dir > 0 ? (p2.endOfData && p2.bars.first <= 0) : (p2.rightOffset >= (api0.rightOffset ?? 0) && i > 1 && p2.bars.last === lastBars.last);
+            atEnd = edgeHit;
             lastBars = p2.bars;
           }
           const v = verifyApi(cur, { dx: exp, dy: 0 }, m, `step ${i}`);
