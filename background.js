@@ -195,6 +195,25 @@ function pageApi(cmd, a) {
         resolution: (() => { try { return chart.resolution(); } catch { return null; } })(),
       };
     };
+    // setVisiblePriceRange() treats its argument as the *data* range and pads it with the
+    // scale's margins (studies with labels request large ones), so the visible range and the
+    // px-per-price ratio come out different from what was asked. Ask, measure the padding,
+    // and ask again for the range that yields the target exactly.
+    const setVisibleExact = (target) => {
+      let req = { from: target.from, to: target.to };
+      let v = null;
+      for (let i = 0; i < 4; i++) {
+        ps.setVisiblePriceRange(req);
+        v = ps.getVisiblePriceRange();
+        const eps = 1e-7 * Math.abs(target.to - target.from);
+        if (Math.abs(v.to - target.to) <= eps && Math.abs(v.from - target.from) <= eps) break;
+        const spanReq = req.to - req.from;
+        const padTop = (v.to - req.to) / spanReq, padBot = (req.from - v.from) / spanReq;
+        const spanNext = (target.to - target.from) / (1 + padTop + padBot);
+        req = { to: target.to - padTop * spanNext, from: target.from + padBot * spanNext };
+      }
+      return v;
+    };
     // Walk "a.b.c" in the chart's property tree (for reading override values back)
     const readProp = (key) => {
       try {
@@ -260,14 +279,15 @@ function pageApi(cmd, a) {
       case 'autoScale': ps.setAutoScale(!!a.on); return snap();
       case 'scrollBars': chart.scrollChartByBar(a.n); return snap();
       case 'setRightOffset': ts.setRightOffset(a.v); return snap();
-      case 'setPriceRange': ps.setVisiblePriceRange(a.range); return snap();
+      case 'setPriceRange': setVisibleExact(a.range); return snap();
       case 'shiftPx': {
         // Works for linear and log scales: convert the pane's edge coordinates, not prices.
         const r = ps.getVisiblePriceRange();
         const yTop = ps.priceToCoordinate(r.to), yBot = ps.priceToCoordinate(r.from);
         const to = ps.coordinateToPrice(yTop - a.dy), from = ps.coordinateToPrice(yBot - a.dy);
-        ps.setVisiblePriceRange({ from, to });
+        setVisibleExact({ from, to });
         const out = snap();
+        out.spanBefore = r.to - r.from; out.spanAfter = out.price ? out.price.to - out.price.from : null;
         out.actual = ps.priceToCoordinate(r.to) - yTop; // measured shift of the old top edge
         return out;
       }
@@ -376,11 +396,27 @@ function staticMask(A, B) {
 // so it still scores badly.
 const KEEP_INK = 0.5;
 
-function sad2(A, B, dx, dy, step) {
+function sad2(A, B, dx, dy, step, strict = false) {
   const w = A.w, h = A.h, a = A.g, b = B.g, bga = A.bg, bgb = B.bg, T = A.T, skip = B.skip;
   const x0 = Math.max(0, -dx), x1 = Math.min(w, w - dx);
   const y0 = Math.max(0, -dy), y1 = Math.min(h, h - dy);
   if (x1 - x0 < w * 0.2 || y1 - y0 < h * 0.3) return Infinity;
+  // Full-resolution frames tolerate 1 px of jitter: with a fractional devicePixelRatio the
+  // chart snaps candle edges differently from one frame to the next, so exact ink masks
+  // disagree along every edge even at the correct shift. (Not applied at quarter scale.)
+  const tol = !A.small && !strict;
+  const inkA = (i) => (a[i] > bga ? a[i] - bga : bga - a[i]) > T;
+  const inkB = (i) => (b[i] > bgb ? b[i] - bgb : bgb - b[i]) > T;
+  const nearA = (i, x, y) => {
+    for (let yy = -1; yy <= 1; yy++) { const yq = y + yy; if (yq < 0 || yq >= h) continue;
+      for (let xx = -1; xx <= 1; xx++) { const xq = x + xx; if (xq < 0 || xq >= w) continue; if (inkA(yq * w + xq)) return true; } }
+    return false;
+  };
+  const nearB = (i, x, y) => {
+    for (let yy = -1; yy <= 1; yy++) { const yq = y + yy; if (yq < 0 || yq >= h) continue;
+      for (let xx = -1; xx <= 1; xx++) { const xq = x + xx; if (xq < 0 || xq >= w) continue; if (inkB(yq * w + xq)) return true; } }
+    return false;
+  };
   // Compare "ink" masks (candles, text): weak pixels such as grid lines and
   // background are ignored, so empty or grid-only overlaps cannot match.
   let uni = 0, bad = 0, n = 0;
@@ -396,7 +432,9 @@ function sad2(A, B, dx, dy, step) {
       n++;
       if (sa || sb) {
         ru++;
-        if (!(sa && sb) || (va > vb ? va - vb : vb - va) > T) rbad++;
+        if (sa && sb) { if ((va > vb ? va - vb : vb - va) > T) rbad++; }
+        else if (!tol) rbad++;
+        else if (sa ? !nearB(rb + x, x + dx, y + dy) : !nearA(ra + x, x, y)) rbad++;
       }
     }
     if (ru) { uni += ru; bad += rbad; rows.push(rbad / ru, ru, rbad); }
@@ -531,8 +569,17 @@ function findShift2D(p, c, r) {
         Math.floor(r.dyLo / 4), Math.ceil(r.dyHi / 4), 1, 1)[0]
     : findShiftWide(p, c, r);
   if (!seed) return { dx: 0, dy: 0, err: Infinity };
-  const f = grid(p, c, seed.dx * 4 - 5, seed.dx * 4 + 5, seed.dy * 4 - 5, seed.dy * 4 + 5, 2, 1)[0];
-  return f ? { dx: f.dx, dy: f.dy, err: f.e } : { dx: 0, dy: 0, err: Infinity };
+  // Full-resolution refinement. The tolerant score is flat over a +-1 px plateau, so the exact
+  // (strict) score breaks the tie among the candidates that share the best tolerant score.
+  const cands = grid(p, c, seed.dx * 4 - 5, seed.dx * 4 + 5, seed.dy * 4 - 5, seed.dy * 4 + 5, 2, 9);
+  if (!cands.length) return { dx: 0, dy: 0, err: Infinity };
+  const top = cands.filter((q) => q.e <= cands[0].e + 0.004);
+  let best = null;
+  for (const q of top) {
+    const es = sad2(p, c, q.dx, q.dy, 1, true);
+    if (!best || es < best.es) best = { dx: q.dx, dy: q.dy, err: q.e, es };
+  }
+  return { dx: best.dx, dy: best.dy, err: best.err };
 }
 
 // 1-D horizontal match on a strip (the time axis): ink-mask mismatch for dx in [lo, hi].
@@ -549,7 +596,14 @@ function matchStrip(A, B, w, h, bg, T, lo, hi) {
       for (let x = x0; x < x1; x++) {
         const va = A[ra + x], vb = B[rb + x];
         const sa = Math.abs(va - bg) > T, sb = Math.abs(vb - bg) > T;
-        if (sa || sb) { uni++; if (!(sa && sb) || Math.abs(va - vb) > T) bad++; }
+        if (!(sa || sb)) continue;
+        uni++;
+        if (sa && sb) { if (Math.abs(va - vb) > T) bad++; continue; }
+        // 1 px horizontal tolerance (sub-pixel snapping at fractional DPR)
+        const ok = sa
+          ? (x + dx > x0 + 1 && Math.abs(B[rb + x - 1] - bg) > T) || (x + dx + 1 < w && Math.abs(B[rb + x + 1] - bg) > T)
+          : (x > 0 && Math.abs(A[ra + x - 1] - bg) > T) || (x + 1 < w && Math.abs(A[ra + x + 1] - bg) > T);
+        if (!ok) bad++;
       }
     }
     if (uni < 40) continue;
@@ -680,7 +734,7 @@ async function grab(tabId, L, onShot) {
   const g = toGray(img);
   const s4 = downsample(g, w, h, 4);
   const bg = modeGray(s4.g);
-  s4.bg = bg; s4.T = 40; // high enough to ignore faint watermarks and grid
+  s4.bg = bg; s4.T = 40; s4.small = true; // high enough to ignore faint watermarks and grid
 
   const f = {
     bmp: c.transferToImageBitmap(), g, w, h, k, s4, spec: null,

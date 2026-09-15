@@ -45,3 +45,23 @@ Diffing two frames at the correct shift showed that the candles matched and the 
 * Volume bars made the pane matcher report 562/566 px for a 558 px move; with Volume hidden the API shift is exact.
 * A click on the watchlist while a capture runs switches the symbol. The extension now stops with `wSymbolChanged`.
 * The TradingView logo watermark is painted on the canvas and has no override; it repeats at the bottom-left of every vertical window (known limitation).
+
+## Follow-up (v1.3.1, owner's chart: dark theme, indicator with shape labels, Windows 125 % scaling)
+
+Reproduced with `--force-device-scale-factor=1.25`, dark theme and *Pivot Points High Low*
+(labels above/below bars). Two independent failures, both fixed:
+
+* **`setVisiblePriceRange()` pads the range with the scale margins.** Studies that draw labels
+  request top/bottom margins; the API then treats the requested range as the *data* range and
+  the visible span grows (~12 %), i.e. every vertical move changed the px-per-price ratio and
+  the next horizontal step could not match. `setVisibleExact()` now measures the padding and
+  asks for the range that yields the target exactly (2 iterations); restore uses it too.
+* **Fractional devicePixelRatio snaps candle edges differently per frame.** At DPR 1.25 candle
+  bodies were 5 device px wide in one frame and 6 in the next, so strict ink masks disagreed
+  along every edge even at the correct shift (err 0.25 vs threshold 0.15). Full-resolution
+  matching now tolerates 1 px (3×3 neighbourhood); because that flattens the score over a
+  ±1 px plateau, the strict score breaks the tie among the plateau candidates (otherwise the
+  search drifted 2 px). Quarter-scale search is unchanged.
+
+Result: 6 steps / 10 frames / 5705×1175 px without warnings on the dark DPR-1.25 chart, and
+the DPR-1 light chart still matches exactly (558/558, −327/−327).
