@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>نتيجة الالتقاط</title>
+<style>
+  :root { --bg: #131722; --raise: #1e222d; --line: #2a2e39; --text: #d1d4dc; --muted: #868993; --blue: #2962ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 "Segoe UI", Tahoma, system-ui, sans-serif; }
+  .bar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 18px; background: var(--raise); border-bottom: 1px solid var(--line); }
+  .bar h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  #meta { color: var(--muted); font-size: 13px; }
+  .actions { margin-inline-start: auto; display: flex; gap: 8px; }
+  button, a.btn { padding: 7px 14px; border-radius: 4px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; font-size: 13px; cursor: pointer; text-decoration: none; }
+  a.btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button:focus-visible, a.btn:focus-visible { outline: 2px solid #5b8cff; outline-offset: 2px; }
+  #warnings { margin: 12px 18px 0; padding: 0; list-style: none; }
+  #warnings li { padding: 6px 10px; margin-bottom: 6px; background: #2a2418; border-inline-start: 3px solid #ff9800; border-radius: 3px; font-size: 13px; }
+  .stage { margin: 14px 18px 24px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; max-height: calc(100vh - 120px); }
+  .stage img { display: block; image-rendering: pixelated; }
+  .stage.fit img { width: 100% !important; height: auto; image-rendering: auto; }
+  #empty { padding: 40px 18px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <h1>لقطة الشارت الممتدّة</h1>
+    <span id="meta"></span>
+    <div class="actions">
+      <button id="fit">احتواء في الشاشة</button>
+      <button id="copy">نسخ الصورة</button>
+      <a id="download" class="btn primary" href="#">تنزيل PNG</a>
+    </div>
+  </div>
+  <ul id="warnings"></ul>
+  <div id="stage" class="stage" dir="ltr"><img id="img" alt="لقطة الشارت"></div>
+  <p id="empty" hidden>لا توجد نتيجة محفوظة بعد. شغّل الالتقاط من أيقونة الإضافة.</p>
+  <script type="module" src="result.js"></script>
+</body>
+</html>

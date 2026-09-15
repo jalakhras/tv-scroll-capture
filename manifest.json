@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "TV Scroll Capture",
+  "version": "1.2.0",
+  "description": "لقطة شاشة ممتدّة لشارت TradingView مع الحفاظ على حجم الشموع",
+  "permissions": ["debugger", "scripting", "storage"],
+  "host_permissions": ["https://*.tradingview.com/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_popup": "popup.html", "default_title": "TV Scroll Capture" },
+  "commands": {
+    "toggle-capture": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "بدء/إيقاف الالتقاط اليدوي"
+    }
+  }
+}

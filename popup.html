@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>TV Scroll Capture</title>
+<style>
+  :root {
+    --bg: #131722; --raise: #1e222d; --line: #2a2e39;
+    --text: #d1d4dc; --muted: #868993; --blue: #2962ff; --red: #f23645;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; width: 330px; background: var(--bg); color: var(--text);
+         font: 13px/1.55 "Segoe UI", Tahoma, system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  header strong { font-size: 14px; font-weight: 600; }
+  .candles { display: flex; align-items: flex-end; gap: 2px; height: 16px; }
+  .candles i { width: 3px; background: #089981; border-radius: 1px; }
+  .candles i:nth-child(2n) { background: var(--red); }
+  #dot { margin-inline-start: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+  #dot.rec { background: var(--red); }
+  @media (prefers-reduced-motion: no-preference) { #dot.rec { animation: blink 1s infinite; } }
+  @keyframes blink { 50% { opacity: .25; } }
+  .pre { margin: 10px 14px 0; padding: 8px 10px; background: var(--raise); border-inline-start: 3px solid #ff9800; border-radius: 3px; color: var(--muted); font-size: 12px; }
+  .pre b { color: var(--text); font-weight: 600; }
+  .group { padding: 10px 14px 12px; border-bottom: 1px solid var(--line); }
+  .group h2 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  .row { display: flex; justify-content: space-between; align-items: center; margin: 5px 0; color: var(--muted); }
+  input[type=number], select { width: 100px; background: var(--raise); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font: inherit; }
+  label.chk { display: flex; align-items: center; gap: 8px; margin: 5px 0; color: var(--muted); }
+  button { width: 100%; margin-top: 8px; padding: 8px; border: 0; border-radius: 4px; font: 600 13px/1 inherit; font-family: inherit; color: #fff; background: var(--blue); cursor: pointer; }
+  button:disabled { opacity: .35; cursor: default; }
+  button.ghost { background: var(--raise); border: 1px solid var(--line); }
+  button.stop { background: var(--red); }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #5b8cff; outline-offset: 1px; }
+  footer { padding: 10px 14px 12px; }
+  #status { font-size: 12px; color: var(--muted); min-height: 18px; }
+  #notTv { color: #ff9800; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  kbd { background: var(--raise); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="candles" aria-hidden="true"><i style="height:9px"></i><i style="height:14px"></i><i style="height:7px"></i><i style="height:12px"></i></span>
+    <strong>لقطة شارت ممتدّة</strong>
+    <span id="dot" aria-hidden="true"></span>
+  </header>
+
+  <p class="pre"><b>قبل البدء:</b> اخرج من وضع Replay، وأخفِ الرسومات اليدوية، واختر أداة المؤشّر العادية، ولا تبدّل التبويب أثناء الالتقاط.</p>
+  <p class="pre" id="notTv" hidden>افتح شارت على tradingview.com ثم أعد فتح الإضافة.</p>
+
+  <div class="group">
+    <h2>التمرير الآلي</h2>
+    <div class="row">الاتجاه
+      <select id="direction">
+        <option value="left">نحو الماضي ←</option>
+        <option value="right">نحو الحاضر →</option>
+      </select>
+    </div>
+    <div class="row">عدد الخطوات <input id="steps" type="number" min="1" max="400" value="20"></div>
+    <div class="row">طول الخطوة (% من العرض) <input id="stepPct" type="number" min="10" max="80" value="50"></div>
+    <div class="row">انتظار بعد كل خطوة (ms) <input id="settleMs" type="number" min="100" max="3000" step="50" value="450"></div>
+    <button id="startAuto" class="start">ابدأ التمرير الآلي</button>
+  </div>
+
+  <div class="group">
+    <h2>الالتقاط اليدوي</h2>
+    <div class="row">فاصل الالتقاط (ms) <input id="intervalMs" type="number" min="120" max="2000" step="10" value="250"></div>
+    <button id="startManual" class="start ghost">ابدأ ثم حرّك الشارت بنفسك</button>
+    <p class="hint">أفضل نتيجة: انقر على الشارت، أبعد الماوس عنه، ثم استخدم الأسهم ← →. للإيقاف أعد فتح الإضافة أو اضغط <kbd>Alt+Shift+S</kbd>.</p>
+  </div>
+
+  <div class="group">
+    <label class="chk"><input id="autoScaleOff" type="checkbox" checked> إيقاف Auto Scale تلقائياً قبل البدء</label>
+    <label class="chk"><input id="verticalTrack" type="checkbox" checked> تتبّع الشموع الخارجة أعلى أو أسفل اللوحة</label>
+    <div class="row">أقصى تحريكات عمودية لكل خطوة <input id="maxVert" type="number" min="1" max="30" value="6"></div>
+    <label class="chk"><input id="hideOverlays" type="checkbox" checked> إخفاء الأسطورة والأزرار العائمة</label>
+    <label class="chk"><input id="includeAxis" type="checkbox" checked> إضافة محور السعر في الطرف</label>
+  </div>
+
+  <footer>
+    <div id="status" role="status" aria-live="polite">جاهز</div>
+    <button id="stop" class="stop" hidden>أوقف واحفظ الصورة</button>
+  </footer>
+  <script src="popup.js"></script>
+</body>
+</html>

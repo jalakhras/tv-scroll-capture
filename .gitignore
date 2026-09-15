@@ -1,0 +1,19 @@
+# OS / editor
+Thumbs.db
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Packaging
+*.zip
+*.crx
+*.pem
+dist/
+
+# Node (tests)
+node_modules/
+npm-debug.log*
+
+# Local debug exports
+debug-exports/
