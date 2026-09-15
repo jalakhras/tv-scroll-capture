@@ -615,6 +615,37 @@ function matchStrip(A, B, w, h, bg, T, lo, hi) {
   return best;
 }
 
+// 1-D vertical match on the price-axis strip: its labels move with the price window, so a
+// vertical move can be verified even when the pane shows few candles.
+function matchStripV(A, B, w, h, bg, T, lo, hi) {
+  let best = { dy: 0, err: Infinity }, second = Infinity;
+  for (let dy = lo; dy <= hi; dy++) {
+    const y0 = Math.max(0, -dy), y1 = Math.min(h, h - dy);
+    if (y1 - y0 < h * 0.3) continue;
+    let uni = 0, bad = 0;
+    for (let y = y0; y < y1; y++) {
+      const ra = y * w, rb = (y + dy) * w;
+      for (let x = 0; x < w; x++) {
+        const va = A[ra + x], vb = B[rb + x];
+        const sa = Math.abs(va - bg) > T, sb = Math.abs(vb - bg) > T;
+        if (!(sa || sb)) continue;
+        uni++;
+        if (sa && sb) { if (Math.abs(va - vb) > T) bad++; continue; }
+        const ok = sa
+          ? (y + dy > y0 && Math.abs(B[rb + x - w] - bg) > T) || (y + dy + 1 < h && Math.abs(B[rb + x + w] - bg) > T)
+          : (y > 0 && Math.abs(A[ra + x - w] - bg) > T) || (y + 1 < h && Math.abs(A[ra + x + w] - bg) > T);
+        if (!ok) bad++;
+      }
+    }
+    if (uni < 40) continue;
+    const e = bad / uni;
+    if (e < best.err) { second = best.err; best = { dy, err: e }; }
+    else if (e < second) second = e;
+  }
+  best.gap = second - best.err;
+  return best;
+}
+
 // Fraction of "ink" pixels in the quarter-scale frame (0 = blank pane)
 function inkFrac(f) {
   const g = f.s4.g, bg = f.s4.bg, T = f.s4.T;
@@ -742,7 +773,7 @@ async function grab(tabId, L, onShot) {
   };
   if (L.axis) {
     const ax = Math.round((L.axis.x - P.x) * k), aw = bmp.width - ax;
-    if (aw > 0) { f.axis = await createImageBitmap(bmp, ax, 0, aw, h); f.axisG = bitmapGray(f.axis); }
+    if (aw > 0) { f.axis = await createImageBitmap(bmp, ax, 0, aw, h); f.axisG = bitmapGray(f.axis); f.axisW = aw; }
   }
   if (bmp.height - h > 2) {
     f.lower = await createImageBitmap(bmp, 0, h, w, bmp.height - h);
@@ -1060,15 +1091,19 @@ async function run(mode, tabId, overrides) {
       let strip = null;
       if (ey === 0 && ex !== 0 && prev.lowerG && cur.lowerG && prev.lowerH === cur.lowerH) {
         strip = matchStrip(prev.lowerG, cur.lowerG, prev.w, prev.lowerH, prev.bg, prev.T, ex - 24, ex + 24);
+        if (strip) strip.dy = 0;
+      } else if (ex === 0 && ey !== 0 && prev.axisG && cur.axisG && prev.axisW === cur.axisW) {
+        const v = matchStripV(prev.axisG, cur.axisG, prev.axisW, prev.h, prev.bg, prev.T, ey - 24, ey + 24);
+        strip = { dx: 0, dy: v.dy, err: v.err, gap: v.gap };
       }
       const stripOk = strip && strip.err <= 0.35 && strip.gap >= 0.05;
       const z = zeroScore(prev, cur);
       dlog('verify', { label, expected: exp, measured: m, strip, zeroShift: z, paneOk, stripOk });
-      if (paneOk && (!stripOk || Math.abs(strip.dx - m.dx) <= 2)) return m;
+      if (paneOk && (!stripOk || (Math.abs(strip.dx - m.dx) <= 2 && Math.abs(strip.dy - m.dy) <= 2))) return m;
       if (stripOk && (!paneOk || m.err > WARN_ERR)) {
-        // pane had too few candles (outside the price window) but the date labels agree
+        // pane had too few candles (outside the price window) but the axis labels agree
         if (!paneOk) warn('strip', 'wStripOnly');
-        return { dx: strip.dx, dy: 0, err: strip.err };
+        return { dx: strip.dx, dy: strip.dy, err: strip.err };
       }
       if (paneOk) return m;
       if (z !== null && z < WARN_ERR) return null; // frame identical to the previous one: stale
@@ -1092,7 +1127,8 @@ async function run(mode, tabId, overrides) {
           // bottom first, then top; a side is finished once it is inside the pane
           if (phase === 'below' && below <= 1) phase = 'above';
           if (phase === 'above' && above <= 1) return true;
-          const room = Math.round(d.paneH * 0.8);
+          // keep >= 40 % overlap: the matcher needs it (and 30 % is its hard floor)
+          const room = Math.round(d.paneH * 0.6);
           if (phase === 'below') dyCss = -Math.min(Math.ceil(below) + 8, room);
           else dyCss = Math.min(Math.ceil(above) + 8, room);
           arrow = dyCss < 0 ? '↓' : '↑';
@@ -1110,6 +1146,7 @@ async function run(mode, tabId, overrides) {
         let cur = await grabS(`vertical ${arrow === '↑' ? 'up' : 'down'} ${v + 1}`);
         const exp = req.dy * k, span = useApi ? Math.abs(exp) * 0.1 + 8 * k : Math.abs(exp) * 0.5 + 20 * k;
         let m = findShift2D(prev, cur, { dxLo: -tol, dxHi: tol, dyLo: Math.round(exp - span), dyHi: Math.round(exp + span) });
+        const lastErr = Number.isFinite(m.err) ? m.err : 1;
         dlog('match', { kind: 'vertical', expected: { dx: 0, dy: exp }, measured: m, zeroShift: zeroScore(prev, cur) });
         if (useApi) {
           m = verifyApi(cur, { dx: 0, dy: exp }, m, 'vertical');
@@ -1122,7 +1159,15 @@ async function run(mode, tabId, overrides) {
             m = findShift2D(prev, cur, { dxLo: -tol, dxHi: tol, dyLo: Math.round(exp - span), dyHi: Math.round(exp + span) });
             m = verifyApi(cur, { dx: 0, dy: exp }, m, 'vertical retry');
           }
-          if (!m) { closeFrame(cur); warn(null, 'wVertWeak', { pct: 100 }); return true; }
+          if (!m) {
+            // Put the price window back where the last accepted frame was taken, otherwise the
+            // next horizontal frame sits at a different height and cannot be matched.
+            closeFrame(cur);
+            warn(null, 'wVertWeak', { pct: Math.round(Math.min(1, lastErr) * 100) });
+            await move(0, -req.dy);
+            await settle();
+            return true;
+          }
         } else if (m.err > REJECT_ERR) {
           warn(null, 'wVertWeak', { pct: Math.round(m.err * 100) });
           closeFrame(cur);
@@ -1158,7 +1203,7 @@ async function run(mode, tabId, overrides) {
         dlog('overlapCheck', { keep, yMax: Math.round(d.yMax), yMin: Math.round(d.yMin), paneH: d.paneH, vis: Math.round(vis) });
         if (vis >= Math.min(d.yMin - d.yMax, d.paneH) * 0.6) return true;
         let dyCss = Math.round(d.paneH / 2 - (d.yMax + d.yMin) / 2);
-        dyCss = Math.max(-Math.round(d.paneH * 0.8), Math.min(Math.round(d.paneH * 0.8), dyCss));
+        dyCss = Math.max(-Math.round(d.paneH * 0.6), Math.min(Math.round(d.paneH * 0.6), dyCss));
         if (Math.abs(dyCss) < 4) return true;
         dlog('overlap', { keep, yMax: Math.round(d.yMax), yMin: Math.round(d.yMin), dyCss });
         setStatus('stVertical', { arrow: dyCss < 0 ? '↓' : '↑' });
@@ -1168,7 +1213,13 @@ async function run(mode, tabId, overrides) {
         const exp = req.dy * k, span = Math.abs(exp) * 0.1 + 8 * k;
         let m = findShift2D(prev, cur, { dxLo: -tol, dxHi: tol, dyLo: Math.round(exp - span), dyHi: Math.round(exp + span) });
         m = verifyApi(cur, { dx: 0, dy: exp }, m, 'overlap');
-        if (!m) { closeFrame(cur); warn(null, 'wVertWeak', { pct: 100 }); return true; }
+        if (!m) {
+          closeFrame(cur);
+          warn(null, 'wVertWeak', { pct: 100 });
+          await move(0, -req.dy); // undo, keep the window where the last frame was taken
+          await settle();
+          return true;
+        }
         return tryAccept(cur, m);
       };
 

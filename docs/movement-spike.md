@@ -65,3 +65,23 @@ Reproduced with `--force-device-scale-factor=1.25`, dark theme and *Pivot Points
 
 Result: 6 steps / 10 frames / 5705×1175 px without warnings on the dark DPR-1.25 chart, and
 the DPR-1 light chart still matches exactly (558/558, −327/−327).
+
+## Follow-up (v1.3.2, owner's BTCUSD 15m replay chart: 35 frames, duplicated/offset segments)
+
+The warning sequence in the owner's result ("Vertical tracking: weak match" followed by a
+"Step N: medium match" three times) exposed two bugs in the API branch:
+
+* Vertical moves were allowed up to 80 % of the pane height while `sad2` refuses overlaps
+  below 30 % (`Infinity`), so any large vertical move — tall BTC candles in a narrow price
+  window — could never be verified. Capped at 60 % (≥ 40 % overlap).
+* A failed vertical move was *not undone* (the drag branch did undo it). The next horizontal
+  frame was then taken at a different height, the pane match failed, the time-axis witness
+  accepted the x shift with dy = 0, and the frame was stitched at the wrong height — the
+  duplicated, vertically offset segments in the owner's image. Failed vertical moves (also the
+  overlap repositioning) now move the window back before continuing.
+* The price-axis strip is now a second witness for vertical moves (labels move with the
+  window), mirroring the time-axis witness for horizontal steps.
+
+Verified on BITSTAMP:BTCUSD 15m, dark theme, DPR 1.25, Pivot labels, price window narrowed
+to 35 % of the auto range: 8 steps / 19 frames / 6811×1683 px, no warnings. Bar Replay itself
+is still untested (not available to anonymous sessions).
