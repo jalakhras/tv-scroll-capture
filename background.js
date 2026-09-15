@@ -1,4 +1,5 @@
-import { putResult } from './idb.js';
+import { putResult, putDebug } from './idb.js';
+import { getLang, t } from './i18n.js';
 
 /* ------------------------------------------------------------------ */
 /* Config                                                              */
@@ -14,6 +15,7 @@ const DEFAULTS = {
   verticalTrack: true,  // follow candles that leave the pane vertically
   maxVert: 6,           // max vertical moves after each horizontal step
   autoScaleOff: true,   // nudge the chart vertically first: TradingView turns Auto Scale off
+  debug: false,         // save raw frames + a step log to IndexedDB (debug.html)
 };
 const MAX_SIDE = 32000;           // final image side limit
 const MAX_AREA = 200_000_000;     // final image pixel limit
@@ -22,15 +24,26 @@ const CANVAS_SIDE = 32767, CANVAS_AREA = 268_000_000; // Chrome hard limits
 const THRESH = { auto: { warn: 0.06, reject: 0.15 }, manual: { warn: 0.12, reject: 0.3 } };
 const COV_SIZE = 140000, COV_OFF = 70000;
 
+// UI strings are stored as i18n keys (+ vars) so the popup renders them in its own language
 const state = {
   running: false, mode: null, tabId: null, stop: false, detached: false,
-  status: 'جاهز', frames: 0, widthPx: 0, heightPx: 0,
+  statusKey: 'stReady', statusVars: null, frames: 0, widthPx: 0, heightPx: 0,
 };
+const setStatus = (key, vars = null) => { state.statusKey = key; state.statusVars = vars; };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const cdp = (tabId, method, params = {}) => chrome.debugger.sendCommand({ tabId }, method, params);
+let traceCdp = false;
+const cdp = async (tabId, method, params = {}) => {
+  if (traceCdp) console.log('[tvsc] cdp >', method, method === 'Page.captureScreenshot' ? '' : JSON.stringify(params));
+  const r = await chrome.debugger.sendCommand({ tabId }, method, params);
+  if (traceCdp) console.log('[tvsc] cdp <', method);
+  return r;
+};
 const exec = async (tabId, func, args = []) =>
   (await chrome.scripting.executeScript({ target: { tabId }, func, args }))[0]?.result;
+// MAIN world: needed to reach window.TradingViewApi (page globals are invisible in the isolated world)
+const execMain = async (tabId, func, args = []) =>
+  (await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func, args }))[0]?.result;
 const badge = (text) => chrome.action.setBadgeText({ text }).catch(() => {});
 
 async function getOpts(overrides) {
@@ -43,10 +56,10 @@ async function getOpts(overrides) {
 /* ------------------------------------------------------------------ */
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'getState') {
-    const { running, mode, status, frames, widthPx, heightPx } = state;
-    sendResponse({ running, mode, status, frames, widthPx, heightPx });
+    const { running, mode, statusKey, statusVars, frames, widthPx, heightPx } = state;
+    sendResponse({ running, mode, statusKey, statusVars, frames, widthPx, heightPx });
   } else if (msg.type === 'start') {
-    if (state.running) sendResponse({ ok: false, error: 'يوجد التقاط قيد التشغيل' });
+    if (state.running) sendResponse({ ok: false, errorKey: 'alreadyRunning' });
     else { run(msg.mode, msg.tabId, msg.opts); sendResponse({ ok: true }); }
   } else if (msg.type === 'stop') {
     state.stop = true;
@@ -113,8 +126,9 @@ function pageDetectLayout() {
   };
 }
 
-function pageHideOverlays(region) {
+function pageHideOverlays(region, detail) {
   const list = (window.__tvscHidden = window.__tvscHidden || []);
+  const added = [];
   const x1 = region.x - 1, y1 = region.y - 1;
   const x2 = region.x + region.w + 1, y2 = region.y + region.h + 1;
   const maxArea = region.w * region.h * 0.4; // never hide full-pane layers
@@ -128,8 +142,150 @@ function pageHideOverlays(region) {
     el.setAttribute('data-tvsc-hidden', '1');
     el.style.setProperty('visibility', 'hidden', 'important');
     list.push(el);
+    if (detail && added.length < 40) {
+      added.push({ tag: el.tagName, cls: String(el.className || '').slice(0, 80), w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.left), y: Math.round(r.top) });
+    }
   }
-  return list.length;
+  return detail ? { total: list.length, added } : list.length;
+}
+
+// Diagnostics: what would receive a mouse event at (x, y)?
+function pageElementAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return null;
+  const cs = getComputedStyle(el);
+  const r = el.getBoundingClientRect();
+  const chain = [];
+  for (let e = el, i = 0; e && i < 5; e = e.parentElement, i++) chain.push(e.tagName + (e.className ? '.' + String(e.className).split(' ')[0] : ''));
+  return {
+    tag: el.tagName, cls: String(el.className || '').slice(0, 80), id: el.id || '',
+    pointerEvents: cs.pointerEvents, visibility: cs.visibility, cursor: cs.cursor,
+    rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+    chain, hasApi: !!(window.TradingViewApi || window.tvWidget), dpr: devicePixelRatio,
+  };
+}
+
+// TradingView's own chart API (movement without mouse drags). Runs in the MAIN world.
+// Conventions: scrollBars(n > 0) shows older bars, i.e. content moves right by n * barSpacing CSS px;
+// shiftPx(dy > 0) moves content down by dy CSS px (price range shifted up).
+function pageApi(cmd, a) {
+  try {
+    const api = window.TradingViewApi;
+    if (!api || typeof api.activeChart !== 'function') return { ok: false, reason: 'no TradingViewApi' };
+    const chart = api.activeChart();
+    const ts = chart.getTimeScale();
+    const panes = chart.getPanes();
+    const pane = panes.find((p) => p.hasMainSeries && p.hasMainSeries()) || panes[0];
+    const ps = pane.getMainSourcePriceScale();
+    // Internal model (bar indices, loading state). Guarded: it is not part of the public API.
+    const model = (() => { try { return chart.chartModel(); } catch { return null; } })();
+    const series = (() => { try { return model ? model.mainSeries() : null; } catch { return null; } })();
+    const snap = () => {
+      const r = ps.getVisiblePriceRange();
+      let bars = null, loading = null, endOfData = null;
+      try { const br = model.timeScale().visibleBarsStrictRange(); if (br) bars = { first: br.firstBar(), last: br.lastBar() }; } catch {}
+      try { loading = chart.getSeries().isLoading(); } catch {}
+      try { endOfData = series.endOfData(); } catch {}
+      return {
+        ok: true, barSpacing: ts.barSpacing(), rightOffset: ts.rightOffset(), auto: ps.isAutoScale(),
+        price: r, top: r ? ps.priceToCoordinate(r.to) : null, bottom: r ? ps.priceToCoordinate(r.from) : null,
+        paneH: pane.getHeight(), mode: ps.getMode(), locked: ps.isLocked(), ratioLocked: chart.isPriceToBarRatioLocked(),
+        panes: panes.length, bars, loading, endOfData,
+        symbol: (() => { try { return chart.symbol(); } catch { return null; } })(),
+        resolution: (() => { try { return chart.resolution(); } catch { return null; } })(),
+      };
+    };
+    // Walk "a.b.c" in the chart's property tree (for reading override values back)
+    const readProp = (key) => {
+      try {
+        let node = model.properties();
+        for (const part of key.split('.')) node = node.childs()[part];
+        return node.value();
+      } catch { return undefined; }
+    };
+    switch (cmd) {
+      case 'probe': return snap();
+      case 'dataRange': {
+        // min/max price of bars [first, last] and where those prices sit on the pane.
+        // Rows are [time, open, high, low, close, ...]; missing indices are skipped.
+        const bars = series.bars();
+        let min = Infinity, max = -Infinity, n = 0;
+        for (let i = a.first; i <= a.last; i++) {
+          const row = bars.valueAt(i);
+          if (!row || row.length < 4) continue;
+          const h = row[2], l = row[3];
+          if (Number.isFinite(h) && h > max) max = h;
+          if (Number.isFinite(l) && l < min) min = l;
+          n++;
+        }
+        if (!n || !Number.isFinite(min) || !Number.isFinite(max)) return { ok: false, reason: 'empty' };
+        return { ok: true, min, max, yMin: ps.priceToCoordinate(min), yMax: ps.priceToCoordinate(max), paneH: pane.getHeight() };
+      }
+      case 'hideOverlayStudies': {
+        // Studies drawn over the main pane on their own scale (Volume) rescale with every
+        // scroll and cannot be stitched; hide them for the capture. Studies that share the
+        // series scale (moving averages, bands) move with the candles and are kept.
+        const mainIdx = panes.indexOf(pane);
+        let seriesInner = null;
+        try { seriesInner = chart.getSeries().priceScale()._priceScale || null; } catch {}
+        const hidden = [];
+        for (const { id } of chart.getAllStudies()) {
+          try {
+            const st = chart.getStudyById(id);
+            if (st.paneIndex() !== mainIdx || !st.isVisible()) continue;
+            const inner = st.priceScale()._priceScale || null;
+            if (seriesInner && inner === seriesInner) continue;
+            st.setVisible(false);
+            hidden.push(id);
+          } catch {}
+        }
+        return { ok: true, hidden };
+      }
+      case 'cursorTool': {
+        let prev = null;
+        try { prev = api.selectedLineTool(); } catch {}
+        api.selectLineTool(a.id);
+        return { ok: true, prev };
+      }
+      case 'showStudies': {
+        for (const id of a.ids) { try { chart.getStudyById(id).setVisible(true); } catch {} }
+        return { ok: true };
+      }
+      case 'overrides': {
+        const prev = {};
+        for (const key of Object.keys(a.set)) prev[key] = readProp(key);
+        chart.applyOverrides(a.set);
+        return { ok: true, prev };
+      }
+      case 'autoScale': ps.setAutoScale(!!a.on); return snap();
+      case 'scrollBars': chart.scrollChartByBar(a.n); return snap();
+      case 'setRightOffset': ts.setRightOffset(a.v); return snap();
+      case 'setPriceRange': ps.setVisiblePriceRange(a.range); return snap();
+      case 'shiftPx': {
+        // Works for linear and log scales: convert the pane's edge coordinates, not prices.
+        const r = ps.getVisiblePriceRange();
+        const yTop = ps.priceToCoordinate(r.to), yBot = ps.priceToCoordinate(r.from);
+        const to = ps.coordinateToPrice(yTop - a.dy), from = ps.coordinateToPrice(yBot - a.dy);
+        ps.setVisiblePriceRange({ from, to });
+        const out = snap();
+        out.actual = ps.priceToCoordinate(r.to) - yTop; // measured shift of the old top edge
+        return out;
+      }
+      default: return { ok: false, reason: 'unknown cmd' };
+    }
+  } catch (e) {
+    return { ok: false, reason: String(e && e.message || e) };
+  }
+}
+
+// Diagnostics: does the page still paint? (rAF within 400 ms, visibility, focus)
+function pageFrameProbe() {
+  return new Promise((resolve) => {
+    const t = performance.now();
+    let done = false;
+    requestAnimationFrame(() => { if (!done) { done = true; resolve({ raf: Math.round(performance.now() - t), vis: document.visibilityState, focus: document.hasFocus() }); } });
+    setTimeout(() => { if (!done) { done = true; resolve({ raf: null, vis: document.visibilityState, focus: document.hasFocus() }); } }, 1000);
+  });
 }
 
 function pageRestore() {
@@ -200,30 +356,60 @@ function findRGB(img, g, value) {
 /* 2D matching                                                         */
 /* content of `a` at (x, y) appears in `b` at (x + dx, y + dy)          */
 /* ------------------------------------------------------------------ */
+// Pixels that are identical ink in both frames at zero shift belong to overlays that do not
+// scroll with the chart (grid lines, live price line, watermark, labels). They are excluded
+// from scoring, otherwise a correct shift still looks bad on a busy real chart.
+function staticMask(A, B) {
+  const a = A.g, b = B.g, n = a.length, bga = A.bg, bgb = B.bg, T = A.T;
+  const m = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const va = a[i], vb = b[i];
+    if ((va > bga ? va - bga : bga - va) > T && (vb > bgb ? vb - bgb : bgb - vb) > T &&
+        (va > vb ? va - vb : vb - va) <= T) m[i] = 1;
+  }
+  return m;
+}
+
+// Robust score: rows are ranked by their own mismatch and the worst rows (up to 50% of the
+// ink) are dropped. Overlays that rescale with the visible range (e.g. the volume histogram
+// at the pane bottom) then no longer hide a correct match. A wrong shift is bad everywhere,
+// so it still scores badly.
+const KEEP_INK = 0.5;
+
 function sad2(A, B, dx, dy, step) {
-  const w = A.w, h = A.h, a = A.g, b = B.g, bga = A.bg, bgb = B.bg, T = A.T;
+  const w = A.w, h = A.h, a = A.g, b = B.g, bga = A.bg, bgb = B.bg, T = A.T, skip = B.skip;
   const x0 = Math.max(0, -dx), x1 = Math.min(w, w - dx);
   const y0 = Math.max(0, -dy), y1 = Math.min(h, h - dy);
   if (x1 - x0 < w * 0.2 || y1 - y0 < h * 0.3) return Infinity;
   // Compare "ink" masks (candles, text): weak pixels such as grid lines and
   // background are ignored, so empty or grid-only overlaps cannot match.
   let uni = 0, bad = 0, n = 0;
+  const rows = [];
   for (let y = y0; y < y1; y += step) {
     const ra = y * w, rb = (y + dy) * w + dx;
+    let ru = 0, rbad = 0;
     for (let x = x0; x < x1; x += step) {
+      if (skip && (skip[ra + x] || skip[rb + x])) continue;
       const va = a[ra + x], vb = b[rb + x];
       const sa = (va > bga ? va - bga : bga - va) > T;
       const sb = (vb > bgb ? vb - bgb : bgb - vb) > T;
       n++;
       if (sa || sb) {
-        uni++;
-        if (!(sa && sb) || (va > vb ? va - vb : vb - va) > T) bad++;
+        ru++;
+        if (!(sa && sb) || (va > vb ? va - vb : vb - va) > T) rbad++;
       }
     }
+    if (ru) { uni += ru; bad += rbad; rows.push(rbad / ru, ru, rbad); }
   }
   if (uni < Math.max(12, n * 0.002)) return 1;
+  // trimmed score over the best rows
+  const idx = [];
+  for (let i = 0; i < rows.length; i += 3) idx.push(i);
+  idx.sort((p, q) => rows[p] - rows[q]);
+  let ku = 0, kb = 0;
+  for (const i of idx) { ku += rows[i + 1]; kb += rows[i + 2]; if (ku >= uni * KEEP_INK) break; }
   const frac = ((x1 - x0) * (y1 - y0)) / (w * h);
-  return bad / uni + 0.03 * (1 - frac);
+  return kb / ku + 0.03 * (1 - frac);
 }
 
 function grid(A, B, dxLo, dxHi, dyLo, dyHi, step, keep) {
@@ -338,6 +524,7 @@ function findShiftWide(p, c, r) {
 }
 
 function findShift2D(p, c, r) {
+  if (!c.skip) { c.skip = staticMask(p, c); c.s4.skip = staticMask(p.s4, c.s4); }
   const n4 = ((r.dxHi - r.dxLo) / 4 + 1) * ((r.dyHi - r.dyLo) / 4 + 1);
   const seed = n4 <= 4000
     ? grid(p.s4, c.s4, Math.floor(r.dxLo / 4), Math.ceil(r.dxHi / 4),
@@ -346,6 +533,40 @@ function findShift2D(p, c, r) {
   if (!seed) return { dx: 0, dy: 0, err: Infinity };
   const f = grid(p, c, seed.dx * 4 - 5, seed.dx * 4 + 5, seed.dy * 4 - 5, seed.dy * 4 + 5, 2, 1)[0];
   return f ? { dx: f.dx, dy: f.dy, err: f.e } : { dx: 0, dy: 0, err: Infinity };
+}
+
+// 1-D horizontal match on a strip (the time axis): ink-mask mismatch for dx in [lo, hi].
+// The time axis is never clipped by the price window, so it verifies a horizontal step even
+// when the pane itself shows no candles. Returns the best dx, its error and the runner-up gap.
+function matchStrip(A, B, w, h, bg, T, lo, hi) {
+  let best = { dx: 0, err: Infinity }, second = Infinity;
+  for (let dx = lo; dx <= hi; dx++) {
+    const x0 = Math.max(0, -dx), x1 = Math.min(w, w - dx);
+    if (x1 - x0 < w * 0.3) continue;
+    let uni = 0, bad = 0;
+    for (let y = 0; y < h; y++) {
+      const ra = y * w, rb = y * w + dx;
+      for (let x = x0; x < x1; x++) {
+        const va = A[ra + x], vb = B[rb + x];
+        const sa = Math.abs(va - bg) > T, sb = Math.abs(vb - bg) > T;
+        if (sa || sb) { uni++; if (!(sa && sb) || Math.abs(va - vb) > T) bad++; }
+      }
+    }
+    if (uni < 40) continue;
+    const e = bad / uni;
+    if (e < best.err) { second = best.err; best = { dx, err: e }; }
+    else if (e < second) second = e;
+  }
+  best.gap = second - best.err;
+  return best;
+}
+
+// Fraction of "ink" pixels in the quarter-scale frame (0 = blank pane)
+function inkFrac(f) {
+  const g = f.s4.g, bg = f.s4.bg, T = f.s4.T;
+  let n = 0;
+  for (let i = 0; i < g.length; i++) if (Math.abs(g[i] - bg) > T) n++;
+  return n / g.length;
 }
 
 function axisChanged(a, b) {
@@ -382,7 +603,9 @@ function clipInfo(f, st) {
     if (bHit && st.covBot[gi] <= st.Y + h) bottom++;
   }
   const need = Math.max(2, Math.round(k));
-  return { top: top >= need, bottom: bottom >= need };
+  // Ink along most of an edge is an overlay drawn against it (volume histogram), not clipping.
+  const overlay = w * 0.35;
+  return { top: top >= need && top < overlay, bottom: bottom >= need && bottom < overlay };
 }
 
 /* ------------------------------------------------------------------ */
@@ -436,7 +659,7 @@ class Grow {
 /* ------------------------------------------------------------------ */
 /* Capture & stitching                                                 */
 /* ------------------------------------------------------------------ */
-async function grab(tabId, L) {
+async function grab(tabId, L, onShot) {
   const P = L.pane;
   const boxW = (L.axis ? L.axis.x + L.axis.w : P.x + P.w) - P.x;
   const boxH = L.bottom - P.y;
@@ -444,6 +667,7 @@ async function grab(tabId, L) {
     format: 'png', fromSurface: true,
     clip: { x: P.x + L.scrollX, y: P.y + L.scrollY, width: boxW, height: boxH, scale: 1 },
   });
+  if (onShot) onShot(shot.data);
   const bmp = await b64ToBitmap(shot.data);
   const k = bmp.width / boxW; // image px per CSS px
   const w = Math.min(bmp.width, Math.round(P.w * k));
@@ -466,7 +690,10 @@ async function grab(tabId, L) {
     const ax = Math.round((L.axis.x - P.x) * k), aw = bmp.width - ax;
     if (aw > 0) { f.axis = await createImageBitmap(bmp, ax, 0, aw, h); f.axisG = bitmapGray(f.axis); }
   }
-  if (bmp.height - h > 2) f.lower = await createImageBitmap(bmp, 0, h, w, bmp.height - h);
+  if (bmp.height - h > 2) {
+    f.lower = await createImageBitmap(bmp, 0, h, w, bmp.height - h);
+    f.lowerG = bitmapGray(f.lower); f.lowerH = f.lower.height; // date labels: 1-D horizontal check
+  }
   bmp.close();
   return f;
 }
@@ -578,9 +805,26 @@ async function run(mode, tabId, overrides) {
   badge('REC');
 
   const WARN_ERR = THRESH[mode].warn, REJECT_ERR = THRESH[mode].reject;
-  const warnings = [];
+  const warnings = []; // [{ key, vars }] rendered by the result page in its own language
   const seen = new Set();
-  const warn = (key, msg) => { if (key) { if (seen.has(key)) return; seen.add(key); } warnings.push(msg); };
+  const warn = (once, key, vars = null) => { if (once) { if (seen.has(once)) return; seen.add(once); } warnings.push({ key, vars }); };
+
+  // ---- diagnostics (opts.debug) ----
+  const t0 = Date.now();
+  const dbg = opts.debug ? { log: [], frames: [], layout: null, mode, opts, createdAt: t0 } : null;
+  traceCdp = !!dbg;
+  const MAX_DBG_FRAMES = 40;
+  let nextShotLabel = null;
+  const dlog = (event, data = {}) => { if (dbg) { dbg.log.push({ t: Date.now() - t0, event, ...data }); console.log('[tvsc]', event, JSON.stringify(data).slice(0, 400)); } };
+  const onShot = (b64) => {
+    if (!dbg || dbg.frames.length >= MAX_DBG_FRAMES) return;
+    const bin = atob(b64), u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    dbg.frames.push({ label: nextShotLabel || `frame ${dbg.frames.length}`, t: Date.now() - t0, blob: new Blob([u8], { type: 'image/png' }) });
+    nextShotLabel = null;
+  };
+  // Zero-shift score without the static mask: if the chart did not move, all ink is "static".
+  const zeroScore = (a, b) => (a && b ? sad2(a.s4, { ...b.s4, skip: null }, 0, 0, 1) : null);
 
   let attached = false, st = null, prev = null;
   const progress = () => {
@@ -588,44 +832,150 @@ async function run(mode, tabId, overrides) {
     state.frames = st.frames; state.widthPx = b.x1 - b.x0; state.heightPx = b.y1 - b.y0;
   };
 
+  let api0 = null; // chart state before we touched it (restored in finally)
   try {
-    state.status = 'تحليل تخطيط الشارت…';
-    const L = await exec(tabId, pageDetectLayout);
-    if (!L || L.pane.w < 100 || L.pane.h < 60) throw new Error('لم يتم العثور على منطقة الشارت في الصفحة');
-
+    setStatus('stLayout');
     await chrome.debugger.attach({ tabId }, '1.3');
     attached = true;
+    // The debugger infobar pushes the page down; detect the layout only after it has settled.
+    await sleep(350);
+    let L = await exec(tabId, pageDetectLayout);
+    for (let i = 0; i < 4 && L; i++) {
+      await sleep(250);
+      const L2 = await exec(tabId, pageDetectLayout);
+      if (L2 && L2.pane.y === L.pane.y && L2.pane.h === L.pane.h && L2.bottom === L.bottom) break;
+      L = L2;
+    }
+    dlog('layout', { layout: L });
+    if (dbg) dbg.layout = L;
+    if (!L || L.pane.w < 100 || L.pane.h < 60) throw Object.assign(new Error('chart area not found'), { key: 'errNoChart' });
+
+    // Movement backend: TradingView's chart API when present (deterministic), CDP drags otherwise.
+    const probe = await execMain(tabId, pageApi, ['probe']).catch(() => null);
+    const useApi = !!(probe && probe.ok && probe.barSpacing > 0);
+    if (useApi) api0 = probe;
+    dlog('mover', { useApi, probe });
+    if (dbg) dbg.mover = useApi ? 'api' : 'drag';
+
+    // Overlays that TradingView paints on the canvas itself (live price line and axis labels)
+    // would repeat at every seam; switch them off for the capture and restore them at the end.
+    if (useApi && opts.hideOverlays) {
+      const set = {
+        'mainSeriesProperties.showPriceLine': false,
+        'mainSeriesProperties.showCountdown': false,
+        'scalesProperties.showSeriesLastValue': false,
+        'scalesProperties.showPrePostMarketPriceLabel': false,
+        'scalesProperties.showStudyLastValue': false,
+        'scalesProperties.showPriceScaleCrosshairLabel': false,
+        'scalesProperties.showTimeScaleCrosshairLabel': false,
+        'mainSeriesProperties.esdShowDividends': false,
+        'mainSeriesProperties.esdShowSplits': false,
+        'mainSeriesProperties.esdShowEarnings': false,
+      };
+      const r = await execMain(tabId, pageApi, ['overrides', { set }]).catch(() => null);
+      if (r && r.ok) {
+        const restore = {};
+        for (const [key, v] of Object.entries(r.prev)) if (v !== undefined) restore[key] = v;
+        api0 = { ...api0, restoreOverrides: restore };
+      }
+      dlog('api', { cmd: 'overrides', result: r });
+      // The crosshair follows the user's mouse; the arrow cursor draws none.
+      const tool = await execMain(tabId, pageApi, ['cursorTool', { id: 'arrow_cursor' }]).catch(() => null);
+      if (tool && tool.ok && tool.prev && tool.prev !== 'arrow_cursor') api0 = { ...api0, restoreTool: tool.prev };
+      dlog('api', { cmd: 'cursorTool', result: tool });
+      const h = await execMain(tabId, pageApi, ['hideOverlayStudies']).catch(() => null);
+      if (h && h.ok && h.hidden.length) api0 = { ...api0, hiddenStudies: h.hidden };
+      dlog('api', { cmd: 'hideOverlayStudies', result: h });
+    }
+    const apiProbe = () => execMain(tabId, pageApi, ['probe']).catch(() => null);
+    // History is fetched on demand while scrolling into the past: wait until the series is idle.
+    const waitLoaded = async () => {
+      if (!useApi) return null;
+      let p2 = null;
+      for (let i = 0; i < 20; i++) {
+        p2 = await apiProbe();
+        if (!p2 || !p2.ok || !p2.loading) break;
+        await sleep(150);
+      }
+      return p2;
+    };
 
     const P = L.pane;
     const hideRect = { x: P.x, y: P.y, w: P.w, h: L.bottom - P.y };
     const parkMouse = () => cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 });
-    const prep = async () => { if (opts.hideOverlays) await exec(tabId, pageHideOverlays, [hideRect]); };
-    const settle = async () => { await parkMouse(); await sleep(opts.settleMs); await prep(); await sleep(80); };
+    let hideLogged = false;
+    const prep = async () => {
+      if (!opts.hideOverlays) return;
+      const r = await exec(tabId, pageHideOverlays, [hideRect, !!dbg && !hideLogged]);
+      if (dbg && !hideLogged) { hideLogged = true; dlog('hideOverlays', { result: r }); }
+    };
+    // After an API move the chart repaints on its next animation frame; wait for one so the
+    // screenshot is not stale (a hidden/occluded window produces no frames at all).
+    const waitPaint = async () => {
+      const f = await exec(tabId, pageFrameProbe);
+      if (f && f.raf === null) {
+        // nudge: synthetic input forces a frame even when the page is not painting
+        await parkMouse();
+        const g = await exec(tabId, pageFrameProbe);
+        dlog('paint', { first: f, afterNudge: g });
+        if (g && g.raf === null) warn('nopaint', 'wNoPaint');
+      }
+    };
+    const settle = async () => {
+      if (useApi) { await waitLoaded(); await waitPaint(); } else await parkMouse();
+      await sleep(opts.settleMs);
+      await prep();
+      await sleep(80);
+    };
     let screen = null; // latest grabbed frame, used to find empty spots to drag from
-    const grabS = async () => (screen = await grab(tabId, L));
+    const grabS = async (label) => { nextShotLabel = label || null; return (screen = await grab(tabId, L, dbg ? onShot : null)); };
+    // move(dx, dy): request a content shift in CSS px; returns the shift actually requested
+    // (the API mover rounds horizontal moves to whole bars).
     const move = async (dx, dy) => {
+      if (useApi) {
+        let ax = 0, ay = 0;
+        if (dx) {
+          const n = Math.max(1, Math.round(Math.abs(dx) / probe.barSpacing)) * Math.sign(dx);
+          const r = await execMain(tabId, pageApi, ['scrollBars', { n }]);
+          ax = n * (r && r.barSpacing || probe.barSpacing);
+          dlog('api', { cmd: 'scrollBars', n, result: r, frame: dbg ? await exec(tabId, pageFrameProbe) : null });
+        }
+        if (dy) {
+          const r = await execMain(tabId, pageApi, ['shiftPx', { dy }]);
+          ay = r && r.ok && Number.isFinite(r.actual) ? r.actual : dy;
+          dlog('api', { cmd: 'shiftPx', dy, result: r });
+        }
+        return { dx: ax, dy: ay };
+      }
       const start = screen ? pickStart(screen, L, dx, dy) : null;
-      if (!start) warn('nostart', 'لم أجد مساحة فارغة لبدء السحب، فاستُخدم منتصف الشارت. إن تحرّكت رسمة بدل الشارت فأخفِ الرسومات.');
+      if (!start) warn('nostart', 'wNoStart');
+      const s = start || { x: Math.round(P.x + P.w / 2 - dx / 2), y: Math.round(P.y + P.h / 2 - dy / 2) };
+      if (dbg) dlog('drag', { dxCss: dx, dyCss: dy, start: s, pickedEmpty: !!start, target: await exec(tabId, pageElementAt, [s.x, s.y]) });
       await drag(tabId, L, dx, dy, start);
+      return { dx, dy };
     };
 
-    if (mode === 'auto') { await parkMouse(); await sleep(150); }
+    if (mode === 'auto' && !useApi) { await parkMouse(); await sleep(150); }
     await prep();
     await sleep(120);
 
     if (opts.autoScaleOff) {
-      // A vertical pan makes TradingView switch Auto Scale off; pan back to the same place
-      state.status = 'إيقاف Auto Scale…';
-      const probe = await grabS();
-      await move(0, 40);
-      await sleep(250);
-      await move(0, -40);
-      closeFrame(probe);
+      setStatus('stAutoScale');
+      if (useApi) {
+        if (probe.auto) dlog('api', { cmd: 'autoScale', result: await execMain(tabId, pageApi, ['autoScale', { on: false }]) });
+      } else {
+        // Drag fallback: a vertical pan makes TradingView switch Auto Scale off; pan back to the same place
+        const before = await grabS('before auto-scale nudge');
+        await move(0, 40);
+        await sleep(250);
+        await move(0, -40);
+        closeFrame(before);
+      }
       await settle();
     }
 
     st = makeStitcher();
-    prev = await grabS();
+    prev = await grabS('frame 0 (base)');
     accept(st, prev, 0, 0);
     progress();
 
@@ -634,7 +984,7 @@ async function run(mode, tabId, overrides) {
 
     const tryAccept = (cur, m) => {
       if (!accept(st, cur, m.dx, m.dy)) {
-        warn('cap', 'بلغت الصورة الحد الأقصى للحجم الذي يسمح به Chrome، تم الإيقاف عند هذه النقطة.');
+        warn('cap', 'wCap');
         closeFrame(cur);
         return false;
       }
@@ -643,101 +993,242 @@ async function run(mode, tabId, overrides) {
       return true;
     };
 
+    // API mover: the shift is known from the chart model; matching only refines it by a few px
+    // and guards against a stale frame. Returns the shift to stitch with, or null to stop.
+    // The model's shift is only a prediction: on real charts the rendered shift was seen to
+    // differ by a few px (562 vs 558) after history loads. The pane match decides; for
+    // horizontal steps the time-axis strip is a second witness that is immune to the price
+    // window and to overlays. Returns the shift to stitch with, or null to stop.
+    const verifyApi = (cur, exp, m, label) => {
+      const ex = Math.round(exp.dx), ey = Math.round(exp.dy);
+      const near = (v, e) => Math.abs(v - e) <= Math.max(12, Math.abs(e) * 0.05);
+      const paneOk = Number.isFinite(m.err) && m.err <= REJECT_ERR && near(m.dx, ex) && near(m.dy, ey);
+      let strip = null;
+      if (ey === 0 && ex !== 0 && prev.lowerG && cur.lowerG && prev.lowerH === cur.lowerH) {
+        strip = matchStrip(prev.lowerG, cur.lowerG, prev.w, prev.lowerH, prev.bg, prev.T, ex - 24, ex + 24);
+      }
+      const stripOk = strip && strip.err <= 0.35 && strip.gap >= 0.05;
+      const z = zeroScore(prev, cur);
+      dlog('verify', { label, expected: exp, measured: m, strip, zeroShift: z, paneOk, stripOk });
+      if (paneOk && (!stripOk || Math.abs(strip.dx - m.dx) <= 2)) return m;
+      if (stripOk && (!paneOk || m.err > WARN_ERR)) {
+        // pane had too few candles (outside the price window) but the date labels agree
+        if (!paneOk) warn('strip', 'wStripOnly');
+        return { dx: strip.dx, dy: 0, err: strip.err };
+      }
+      if (paneOk) return m;
+      if (z !== null && z < WARN_ERR) return null; // frame identical to the previous one: stale
+      return null;
+    };
+
     // Reveal candles cut at the top/bottom edge. Returns false if the size cap was hit.
-    const trackVertical = async () => {
+    // API branch: compare the min/max price of the bars in `newBars` with the visible price
+    // window (exact, unaffected by overlays); drag branch: look for ink at the pane edges.
+    const trackVertical = async (newBars) => {
       if (!opts.verticalTrack) return true;
+      let phase = 'below';
       for (let v = 0; v < opts.maxVert && !state.stop; v++) {
-        const clip = clipInfo(prev, st);
-        if (!clip.top && !clip.bottom) return true;
-        if (clip.top && clip.bottom) {
-          warn('tall', 'بعض الشموع أو الحركات أطول من ارتفاع اللوحة في لقطة واحدة. صغّر المقياس السعري قليلاً إن ظهرت فجوات.');
-          return true;
+        let dyCss, arrow;
+        if (useApi) {
+          if (!newBars || newBars.first > newBars.last) return true;
+          const d = await execMain(tabId, pageApi, ['dataRange', newBars]).catch(() => null);
+          if (!d || !d.ok) return true;
+          const below = d.yMin - d.paneH, above = -d.yMax; // px of candle outside the pane
+          dlog('clip', { newBars, below: Math.round(below), above: Math.round(above), min: d.min, max: d.max, phase });
+          // bottom first, then top; a side is finished once it is inside the pane
+          if (phase === 'below' && below <= 1) phase = 'above';
+          if (phase === 'above' && above <= 1) return true;
+          const room = Math.round(d.paneH * 0.8);
+          if (phase === 'below') dyCss = -Math.min(Math.ceil(below) + 8, room);
+          else dyCss = Math.min(Math.ceil(above) + 8, room);
+          arrow = dyCss < 0 ? '↓' : '↑';
+        } else {
+          const clip = clipInfo(prev, st);
+          if (!clip.top && !clip.bottom) return true;
+          if (clip.top && clip.bottom) { warn('tall', 'wTall'); return true; }
+          dyCss = (clip.top ? 1 : -1) * Math.round(P.h * 0.4);
+          arrow = clip.top ? '↑' : '↓';
         }
-        const dyCss = (clip.top ? 1 : -1) * Math.round(P.h * 0.4);
-        state.status = `تتبّع عمودي ${clip.top ? '↑' : '↓'}…`;
-        await move(0, dyCss);
+        setStatus('stVertical', { arrow });
+        const req = await move(0, dyCss);
         await settle();
 
-        const cur = await grabS();
-        const exp = dyCss * k, span = Math.abs(exp) * 0.5 + 20 * k;
-        const m = findShift2D(prev, cur, { dxLo: -tol, dxHi: tol, dyLo: Math.round(exp - span), dyHi: Math.round(exp + span) });
-        if (m.err > REJECT_ERR) {
-          warn(null, `تتبّع عمودي: تطابق ضعيف (${Math.round(m.err * 100)}%)، تم تجاهل هذه اللقطة وإرجاع الشارت لمكانه.`);
+        let cur = await grabS(`vertical ${arrow === '↑' ? 'up' : 'down'} ${v + 1}`);
+        const exp = req.dy * k, span = useApi ? Math.abs(exp) * 0.1 + 8 * k : Math.abs(exp) * 0.5 + 20 * k;
+        let m = findShift2D(prev, cur, { dxLo: -tol, dxHi: tol, dyLo: Math.round(exp - span), dyHi: Math.round(exp + span) });
+        dlog('match', { kind: 'vertical', expected: { dx: 0, dy: exp }, measured: m, zeroShift: zeroScore(prev, cur) });
+        if (useApi) {
+          m = verifyApi(cur, { dx: 0, dy: exp }, m, 'vertical');
+          if (!m) {
+            // stale frame (chart had not repainted yet): one more chance
+            closeFrame(cur);
+            await sleep(Math.max(600, opts.settleMs));
+            await settle();
+            cur = await grabS(`vertical ${arrow === '↑' ? 'up' : 'down'} ${v + 1} (retry)`);
+            m = findShift2D(prev, cur, { dxLo: -tol, dxHi: tol, dyLo: Math.round(exp - span), dyHi: Math.round(exp + span) });
+            m = verifyApi(cur, { dx: 0, dy: exp }, m, 'vertical retry');
+          }
+          if (!m) { closeFrame(cur); warn(null, 'wVertWeak', { pct: 100 }); return true; }
+        } else if (m.err > REJECT_ERR) {
+          warn(null, 'wVertWeak', { pct: Math.round(m.err * 100) });
           closeFrame(cur);
           await move(0, -dyCss); // restore position so the next horizontal match still lines up
           await settle();
           return true;
-        }
-        if (Math.abs(m.dy) < Math.abs(exp) * 0.2) { closeFrame(cur); return true; }
+        } else if (Math.abs(m.dy) < Math.abs(exp) * 0.2) { closeFrame(cur); return true; }
         if (!tryAccept(cur, m)) return false;
       }
-      const clip = clipInfo(prev, st);
-      if (clip.top || clip.bottom) {
-        warn('maxvert', 'بلغ التتبّع العمودي حدّه في بعض المواضع. زد "أقصى تحريكات عمودية" أو صغّر المقياس السعري.');
-      }
+      if (useApi) warn('maxvert', 'wMaxVert');
+      else { const clip = clipInfo(prev, st); if (clip.top || clip.bottom) warn('maxvert', 'wMaxVert'); }
       return true;
     };
 
     if (mode === 'auto') {
-      let ok = await trackVertical();
       const dir = opts.direction === 'left' ? 1 : -1; // drag right = older bars
+      let lastBars = useApi ? (await waitLoaded())?.bars || null : null;
+      let ok = await trackVertical(lastBars);
       const pct = Math.min(80, Math.max(10, Number(opts.stepPct) || 50));
       const stepCss = Math.max(40, Math.round((P.w * pct) / 100));
-      const exp = dir * stepCss * k;
-      const span = Math.abs(exp) * 0.5 + 20 * k;
       let stalls = 0, scaleChecked = false;
 
-      for (let i = 1; i <= opts.steps && ok && !state.stop; i++) {
-        state.status = `خطوة ${i} من ${opts.steps}…`;
-        await move(dir * stepCss, 0);
+      // Before a horizontal step make sure the bars that stay visible (the overlap) have their
+      // candles inside the price window, otherwise the pane offers nothing to verify against.
+      const ensureOverlapVisible = async () => {
+        if (!useApi || !lastBars) return true;
+        const nOut = Math.round(stepCss / probe.barSpacing);
+        const keep = dir > 0 ? { first: lastBars.first, last: lastBars.last - nOut } : { first: lastBars.first + nOut, last: lastBars.last };
+        if (keep.first > keep.last) return true;
+        const d = await execMain(tabId, pageApi, ['dataRange', keep]).catch(() => null);
+        if (!d || !d.ok) return true;
+        const vis = Math.min(d.yMin, d.paneH) - Math.max(d.yMax, 0); // visible part of the candle span
+        dlog('overlapCheck', { keep, yMax: Math.round(d.yMax), yMin: Math.round(d.yMin), paneH: d.paneH, vis: Math.round(vis) });
+        if (vis >= Math.min(d.yMin - d.yMax, d.paneH) * 0.6) return true;
+        let dyCss = Math.round(d.paneH / 2 - (d.yMax + d.yMin) / 2);
+        dyCss = Math.max(-Math.round(d.paneH * 0.8), Math.min(Math.round(d.paneH * 0.8), dyCss));
+        if (Math.abs(dyCss) < 4) return true;
+        dlog('overlap', { keep, yMax: Math.round(d.yMax), yMin: Math.round(d.yMin), dyCss });
+        setStatus('stVertical', { arrow: dyCss < 0 ? '↓' : '↑' });
+        const req = await move(0, dyCss);
         await settle();
+        const cur = await grabS('overlap reposition');
+        const exp = req.dy * k, span = Math.abs(exp) * 0.1 + 8 * k;
+        let m = findShift2D(prev, cur, { dxLo: -tol, dxHi: tol, dyLo: Math.round(exp - span), dyHi: Math.round(exp + span) });
+        m = verifyApi(cur, { dx: 0, dy: exp }, m, 'overlap');
+        if (!m) { closeFrame(cur); warn(null, 'wVertWeak', { pct: 100 }); return true; }
+        return tryAccept(cur, m);
+      };
 
-        const cur = await grabS();
-        const m = findShift2D(prev, cur, { dxLo: Math.round(exp - span), dxHi: Math.round(exp + span), dyLo: -tol, dyHi: tol });
+      for (let i = 1; i <= opts.steps && ok && !state.stop; i++) {
+        setStatus('stStep', { i, n: opts.steps });
+        if (!(await ensureOverlapVisible())) break;
+        const req = await move(dir * stepCss, 0);
+        await settle();
+        const exp = req.dx * k;
+        const span = useApi ? Math.abs(exp) * 0.1 + 8 * k : Math.abs(exp) * 0.5 + 20 * k;
+
+        let cur = await grabS(`step ${i}`);
+        let m = findShift2D(prev, cur, { dxLo: Math.round(exp - span), dxHi: Math.round(exp + span), dyLo: -tol, dyHi: tol });
+        if (useApi && m.err > WARN_ERR) {
+          // History may still be loading after a scroll into the past: give it one more chance.
+          closeFrame(cur);
+          await sleep(Math.max(600, opts.settleMs));
+          await waitLoaded();
+          await prep();
+          cur = await grabS(`step ${i} (retry)`);
+          m = findShift2D(prev, cur, { dxLo: Math.round(exp - span), dxHi: Math.round(exp + span), dyLo: -tol, dyHi: tol });
+        }
+        const z = m.err > WARN_ERR || dbg ? zeroScore(prev, cur) : null;
+        dlog('match', { kind: 'step', i, expected: { dx: exp, dy: 0 }, measured: m, zeroShift: z });
+
+        let newBars = null, atEnd = false;
+        if (useApi) {
+          const p2 = await apiProbe();
+          if (p2 && p2.ok && (p2.symbol !== probe.symbol || p2.resolution !== probe.resolution)) {
+            // Someone switched the chart under us (watchlist click, hotkey): never stitch that.
+            warn(null, 'wSymbolChanged', { from: probe.symbol, to: p2.symbol });
+            closeFrame(cur);
+            break;
+          }
+          if (p2 && p2.ok && p2.bars) {
+            newBars = lastBars
+              ? (dir > 0 ? { first: p2.bars.first, last: Math.min(p2.bars.last, lastBars.first - 1) }
+                         : { first: Math.max(p2.bars.first, lastBars.last + 1), last: p2.bars.last })
+              : p2.bars;
+            // Reached the first bar (or the realtime edge): finish after this frame.
+            atEnd = dir > 0 ? (p2.endOfData && p2.bars.first <= 0) : (p2.rightOffset >= (api0.rightOffset ?? 0) && i > 1 && p2.bars.last === lastBars.last);
+            lastBars = p2.bars;
+          }
+          const v = verifyApi(cur, { dx: exp, dy: 0 }, m, `step ${i}`);
+          if (!v) {
+            const zz = z ?? zeroScore(prev, cur);
+            if (zz < WARN_ERR) warn(null, 'wStall', { i, pct: Math.round((1 - zz) * 100) });
+            else warn(null, 'wStepWeak', { i, pct: Math.round(Math.min(1, m.err) * 100) });
+            closeFrame(cur);
+            break;
+          }
+          m = v;
+        }
 
         if (!scaleChecked) {
           scaleChecked = true;
-          if (Math.abs(m.dy) <= 1 && axisChanged(prev.axisG, cur.axisG)) {
+          const p2 = useApi ? await execMain(tabId, pageApi, ['probe']).catch(() => null) : null;
+          // Same price span = same px per price unit (the range itself moves with vertical tracking)
+          const span0 = probe.price ? probe.price.to - probe.price.from : 0;
+          const apiScaleSame = p2 && p2.ok && p2.price && span0 > 0 &&
+            Math.abs((p2.price.to - p2.price.from) - span0) < 1e-6 * span0;
+          if (p2) dlog('scaleCheck', { before: probe.price, after: p2.price, same: apiScaleSame });
+          if (useApi ? !apiScaleSame : (Math.abs(m.dy) <= 1 && axisChanged(prev.axisG, cur.axisG))) {
             if (m.err > WARN_ERR) {
-              warn('scale', 'المقياس السعري تغيّر مع الحركة الأفقية، فتم الإيقاف لتجنّب دمج خاطئ. تأكد أن زر A مطفأ، وأن خيار Lock price to bar ratio غير مفعّل.');
+              warn('scale', 'wScale');
               closeFrame(cur);
               break;
             }
-            warn('scale-soft', 'محور السعر تغيّر قليلاً بعد أول تحريك، لكن الشموع تطابقت. راجع الصورة للتأكد.');
+            warn('scale-soft', 'wScaleSoft');
           }
         }
-        if (m.err > REJECT_ERR) {
-          warn(null, `خطوة ${i}: تطابق ضعيف (${Math.round(m.err * 100)}%)، تم إيقاف الالتقاط عند هذه النقطة.`);
+        if (useApi && m.err > REJECT_ERR && inkFrac(cur) < 0.002) {
+          // Scrolled past the first/last bar: the pane is blank now.
+          warn('end', 'wEnd');
           closeFrame(cur);
           break;
         }
-        if (m.err > WARN_ERR) warn(null, `خطوة ${i}: تطابق متوسط (${Math.round(m.err * 100)}%)، راجع موضع الوصل.`);
+        if (m.err > REJECT_ERR) {
+          // A near-perfect zero-shift match means the chart did not move at all (the drag
+          // never reached it) rather than a bad stitch; say so instead of "weak match".
+          if (z !== null && z < WARN_ERR) warn(null, 'wStall', { i, pct: Math.round((1 - z) * 100) });
+          else warn(null, 'wStepWeak', { i, pct: Math.round(m.err * 100) });
+          closeFrame(cur);
+          break;
+        }
+        if (m.err > WARN_ERR) warn(null, 'wStepMid', { i, pct: Math.round(m.err * 100) });
 
         if (Math.abs(m.dx) < Math.abs(exp) * 0.2) {
           closeFrame(cur);
-          if (++stalls >= 2) { warn('end', 'الشارت توقّف عن الحركة، غالباً وصلنا لنهاية البيانات المتاحة.'); break; }
+          if (++stalls >= 2) { warn('end', 'wEnd'); break; }
           continue;
         }
         stalls = 0;
         if (!tryAccept(cur, m)) break;
-        ok = await trackVertical();
+        ok = await trackVertical(newBars);
+        if (atEnd) { warn('end', 'wEndReached'); break; }
       }
     } else {
       let bad = 0;
       while (!state.stop) {
-        state.status = `التقاط يدوي: حرّك الشارت الآن (${st.frames} مقطع)`;
+        setStatus('stManual', { frames: st.frames });
         await sleep(opts.intervalMs);
         await prep();
 
-        const cur = await grabS();
+        const cur = await grabS(dbg && dbg.frames.length < MAX_DBG_FRAMES ? `manual sample ${dbg.frames.length}` : null);
         const m = findShift2D(prev, cur, {
           dxLo: -Math.round(cur.w * 0.8), dxHi: Math.round(cur.w * 0.8),
           dyLo: -Math.round(cur.h * 0.6), dyHi: Math.round(cur.h * 0.6),
         });
+        dlog('match', { kind: 'manual', measured: m, zeroShift: dbg ? zeroScore(prev, cur) : null });
 
         if (m.err > REJECT_ERR) {
           bad++;
-          if (bad === 1 || bad % 10 === 0) warn(null, 'تم تجاهل إطارات لم يمكن مطابقتها. حرّك الشارت أبطأ، ولا تغيّر الزوم أثناء الالتقاط.');
+          if (bad === 1 || bad % 10 === 0) warn(null, 'wManualSkip');
           closeFrame(cur);
           continue;
         }
@@ -746,23 +1237,41 @@ async function run(mode, tabId, overrides) {
       }
     }
   } catch (e) {
-    if (state.detached) warn(null, 'تم فصل الالتقاط (أُغلق شريط التصحيح أو التبويب).');
-    else { warn(null, 'خطأ: ' + (e?.message || e)); state.status = 'خطأ: ' + (e?.message || e); }
+    dlog('error', { message: String(e?.message || e), detached: state.detached });
+    if (state.detached) warn(null, 'wDetached');
+    else if (e?.key) { warn(null, e.key); setStatus('stError', { msg: t(await getLang(), e.key) }); }
+    else { warn(null, 'wError', { msg: String(e?.message || e) }); setStatus('stError', { msg: String(e?.message || e) }); }
   } finally {
     try { await exec(tabId, pageRestore); } catch {}
+    if (api0 && !state.detached) {
+      // Put the chart back where it was (F12): position, price range, Auto Scale.
+      try {
+        await execMain(tabId, pageApi, ['setRightOffset', { v: api0.rightOffset }]);
+        if (api0.price) await execMain(tabId, pageApi, ['setPriceRange', { range: api0.price }]);
+        if (api0.auto) await execMain(tabId, pageApi, ['autoScale', { on: true }]);
+        if (api0.restoreOverrides) await execMain(tabId, pageApi, ['overrides', { set: api0.restoreOverrides }]);
+        if (api0.hiddenStudies) await execMain(tabId, pageApi, ['showStudies', { ids: api0.hiddenStudies }]);
+        if (api0.restoreTool) await execMain(tabId, pageApi, ['cursorTool', { id: api0.restoreTool }]);
+      } catch {}
+    }
     if (attached && !state.detached) { try { await chrome.debugger.detach({ tabId }); } catch {} }
+  }
+
+  if (dbg) {
+    dlog('end', { frames: st ? st.frames : 0, warnings });
+    try { await putDebug(dbg); } catch (e) { console.warn('debug save failed', e); }
   }
 
   try {
     if (st && st.frames) {
-      state.status = 'دمج الصورة…';
+      setStatus('stCompose');
       const out = await compose(st, opts.includeAxis);
       await putResult({ ...out, frames: st.frames, warnings, mode, createdAt: Date.now() });
       await chrome.tabs.create({ url: chrome.runtime.getURL('result.html') });
-      state.status = `تم: ${st.frames} مقطع، ${out.width}×${out.height}px`;
+      setStatus('stDone', { frames: st.frames, w: out.width, h: out.height });
     }
   } catch (e) {
-    state.status = 'فشل الدمج: ' + (e?.message || e);
+    setStatus('stComposeFailed', { msg: String(e?.message || e) });
   } finally {
     if (st) { st.main.free(); st.axis.free(); st.lower.free(); }
     state.running = false;

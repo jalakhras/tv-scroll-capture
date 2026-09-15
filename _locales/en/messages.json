@@ -1,0 +1,4 @@
+{
+  "extDescription": { "message": "Extended screenshot of a TradingView chart that preserves on-screen candle size" },
+  "cmdToggle": { "message": "Start/stop manual capture" }
+}

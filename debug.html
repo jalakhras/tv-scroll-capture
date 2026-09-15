@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title data-i18n="debugTitle">TV Scroll Capture</title>
+<style>
+  :root { --bg: #131722; --raise: #1e222d; --line: #2a2e39; --text: #d1d4dc; --muted: #868993; --blue: #2962ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.6 "Segoe UI", Tahoma, system-ui, sans-serif; }
+  .bar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 18px; background: var(--raise); border-bottom: 1px solid var(--line); }
+  .bar h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  #meta { color: var(--muted); }
+  .actions { margin-inline-start: auto; display: flex; gap: 8px; align-items: center; }
+  button, select { padding: 6px 12px; border-radius: 4px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; cursor: pointer; }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  section { margin: 14px 18px; }
+  h2 { font-size: 14px; margin: 0 0 8px; }
+  pre { margin: 0; padding: 10px; background: var(--raise); border: 1px solid var(--line); border-radius: 4px; overflow: auto; direction: ltr; text-align: left; font-size: 12px; max-height: 320px; }
+  table { border-collapse: collapse; width: 100%; direction: ltr; text-align: left; font-size: 12px; }
+  th, td { border: 1px solid var(--line); padding: 4px 8px; vertical-align: top; }
+  th { background: var(--raise); }
+  td.json { font-family: Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  .frames { display: flex; flex-direction: column; gap: 14px; }
+  figure { margin: 0; border: 1px solid var(--line); border-radius: 4px; overflow: auto; background: var(--raise); }
+  figcaption { padding: 6px 10px; color: var(--muted); direction: ltr; text-align: left; }
+  figure img { display: block; max-width: 100%; }
+  #empty { padding: 40px 18px; color: var(--muted); }
+  .warn { color: #ff9800; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <h1 data-i18n="debugHeading"></h1>
+    <span id="meta"></span>
+    <div class="actions">
+      <select id="lang" aria-label="Language">
+        <option value="ar" data-i18n="langAr"></option>
+        <option value="en" data-i18n="langEn"></option>
+      </select>
+      <button id="export" class="primary" data-i18n="exportJson"></button>
+    </div>
+  </div>
+  <p id="empty" hidden data-i18n="debugEmpty"></p>
+  <section id="layoutSec"><h2 data-i18n="debugLayout"></h2><pre id="layout"></pre></section>
+  <section id="logSec"><h2 data-i18n="debugLog"></h2><table id="log"><thead><tr><th>t (ms)</th><th>event</th><th>data</th></tr></thead><tbody></tbody></table></section>
+  <section id="framesSec"><h2 data-i18n="debugFrames"></h2><div id="frames" class="frames"></div></section>
+  <script type="module" src="debug.js"></script>
+</body>
+</html>

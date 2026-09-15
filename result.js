@@ -1,12 +1,31 @@
 import { getResult } from './idb.js';
+import { getLang, setLang, t, tm, applyDom } from './i18n.js';
 
 const $ = (id) => document.getElementById(id);
+let lang = await getLang();
 const r = await getResult();
+
+function render() {
+  applyDom(lang);
+  $('lang').value = lang;
+  if (!r?.blob) return;
+  const mode = t(lang, r.mode === 'auto' ? 'modeAuto' : 'modeManual');
+  $('meta').textContent = t(lang, 'meta', { w: r.width, h: r.height, frames: r.frames, mode });
+  $('warnings').replaceChildren(...(r.warnings || []).map((w) => {
+    const li = document.createElement('li');
+    li.textContent = tm(lang, w);
+    return li;
+  }));
+  $('fit').textContent = t(lang, $('stage').classList.contains('fit') ? 'native' : 'fit');
+}
+
+$('lang').onchange = async () => { lang = $('lang').value; await setLang(lang); render(); };
 
 if (!r?.blob) {
   $('stage').hidden = true;
   $('empty').hidden = false;
-  document.querySelector('.actions').hidden = true;
+  for (const el of document.querySelectorAll('.actions > :not(#lang)')) el.hidden = true;
+  render();
 } else {
   const url = URL.createObjectURL(r.blob);
   const img = $('img');
@@ -18,30 +37,21 @@ if (!r?.blob) {
 
   const when = new Date(r.createdAt);
   const stamp = when.toISOString().slice(0, 19).replace(/[:T]/g, '-');
-  $('meta').textContent = `${r.width}×${r.height}px، ${r.frames} مقطع، ${r.mode === 'auto' ? 'آلي' : 'يدوي'}`;
-
   const dl = $('download');
   dl.href = url;
   dl.download = `TradingView_scroll_${stamp}.png`;
 
-  for (const w of r.warnings || []) {
-    const li = document.createElement('li');
-    li.textContent = w;
-    $('warnings').append(li);
-  }
-
-  $('fit').onclick = () => {
-    const on = $('stage').classList.toggle('fit');
-    $('fit').textContent = on ? 'الحجم الأصلي' : 'احتواء في الشاشة';
-  };
+  $('fit').onclick = () => { $('stage').classList.toggle('fit'); render(); };
 
   $('copy').onclick = async () => {
     try {
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': r.blob })]);
-      $('copy').textContent = 'تم النسخ';
+      $('copy').textContent = t(lang, 'copied');
     } catch {
-      $('copy').textContent = 'تعذّر النسخ';
+      $('copy').textContent = t(lang, 'copyFailed');
     }
-    setTimeout(() => ($('copy').textContent = 'نسخ الصورة'), 1800);
+    setTimeout(() => ($('copy').textContent = t(lang, 'copy')), 1800);
   };
+
+  render();
 }
