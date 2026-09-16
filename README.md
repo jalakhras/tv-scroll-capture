@@ -32,8 +32,10 @@ better than a wrong one). A CDP mouse-drag fallback is used on pages without the
   last candle.
 * **Manual capture** — press start, then move the chart yourself (arrow keys work best);
   press the button again or `Alt+Shift+S` to stop and save.
-* **Vertical tracking** — candles that leave the pane top/bottom are followed automatically;
-  the final image grows in height, candles never change size.
+* **Vertical tracking** — the price window you start with is captured along the whole width
+  (so levels, lines and drawings you could see stay continuous), and candles that leave it
+  above or below are followed automatically; the final image grows in height, candles never
+  change size. Zoom the price scale before starting to choose how much vertical room you want.
 * **Debug mode** — saves every raw frame and a step log; open the debug page and export JSON
   when reporting a problem.
 * **Language** — the selector in the popup header switches the whole UI (popup, result and
@@ -47,10 +49,10 @@ repainting and the capture pauses with a warning.
 * Chrome shows the “TV Scroll Capture started debugging this browser” bar while a capture runs;
   the extension uses the DevTools protocol for screenshots. Closing the bar stops the capture
   and keeps what was captured.
-* The TradingView logo watermark is drawn on the chart canvas and has no switch. The extension
-  locates it from the first frames and cuts it out of every frame so the neighbouring frame
-  supplies the real pixels underneath; a cut-out is kept only where nothing else covers that
-  spot *and* candles lie under the logo, so no chart content is ever lost.
+* Static overlays painted on the chart canvas (the TradingView logo, the "Replay" watermark)
+  have no switch. The extension locates them from the first frames and cuts them out of every
+  frame so the neighbouring frame supplies the real pixels underneath; a cut-out is kept only
+  where nothing else covers that spot *and* candles lie under it, so no chart content is lost.
 * Nothing leaves your machine: no network requests, the result is stored in IndexedDB.
 
 ## Development
@@ -90,8 +92,10 @@ the v1.3 design. Run `node --check *.js` before committing.
   نقطة تريدها، ثم شغّل **نحو الحاضر** بعدد خطوات كبير — يتوقف وحده عند آخر شمعة.
 * **الالتقاط اليدوي** — اضغط البدء ثم حرّك الشارت بنفسك (الأسهم أفضل)، وللإيقاف أعد الضغط
   أو `Alt+Shift+S`.
-* **التتبّع العمودي** — الشموع الخارجة أعلى أو أسفل اللوحة تُتابَع تلقائياً؛ الصورة تكبر
-  ارتفاعاً ولا يتغير حجم الشموع.
+* **التتبّع العمودي** — النافذة السعرية التي تبدأ بها تُلتقط على كامل العرض (فتبقى المستويات
+  والخطوط والرسومات التي تراها متصلة)، والشموع الخارجة منها أعلى أو أسفل تُتابَع تلقائياً؛
+  الصورة تكبر ارتفاعاً ولا يتغير حجم الشموع. اضبط تكبير مقياس السعر قبل البدء لتحديد المدى
+  العمودي الذي تريده.
 * **وضع التشخيص** — يحفظ كل إطار خام وسجل الخطوات؛ افتح صفحة التشخيص وصدّر JSON عند
   الإبلاغ عن مشكلة.
 * **اللغة** — القائمة في رأس النافذة تبدّل كل الواجهة (النافذة، صفحة النتيجة، صفحة
@@ -104,9 +108,10 @@ the v1.3 design. Run `node --check *.js` before committing.
 
 * يظهر شريط «TV Scroll Capture بدأ تصحيح هذا المتصفح» أثناء الالتقاط لأن الإضافة تستخدم
   بروتوكول DevTools للقطات. إغلاقه يوقف الالتقاط ويحفظ ما التُقط.
-* شعار TradingView مرسوم على canvas الشارت ولا مفتاح لإخفائه. تحدّد الإضافة موضعه من الإطارات
-  الأولى وتقصّه من كل إطار ليملأ الإطار المجاور ما تحته بالمحتوى الحقيقي؛ ولا تُبقي قصاصته إلا حيث
-  لا يغطي المكان إطار آخر **و**توجد شموع تحت الشعار، فلا يُفقد أي محتوى.
+* العناصر الثابتة المرسومة على canvas الشارت (شعار TradingView، علامة «Replay» المائية) لا مفتاح
+  لإخفائها. تحدّد الإضافة مواضعها من الإطارات الأولى وتقصّها من كل إطار ليملأ الإطار المجاور ما
+  تحتها بالمحتوى الحقيقي؛ ولا تُبقي القصاصة إلا حيث لا يغطي المكان إطار آخر **و**توجد شموع تحتها،
+  فلا يُفقد أي محتوى.
 * لا يغادر شيء جهازك: لا طلبات شبكة، والنتيجة تُحفظ في IndexedDB.
 
 ## التطوير

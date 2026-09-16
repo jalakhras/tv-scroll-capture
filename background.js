@@ -229,8 +229,11 @@ function pageApi(cmd, a) {
       case 'dataRange': {
         // min/max price of bars [first, last] and where those prices sit on the pane.
         // Rows are [time, open, high, low, close, ...]; missing indices are skipped.
+        // a.cover (the price window at start) is included so drawings and levels the user could
+        // see are captured along the whole width, not only the candles.
         const bars = series.bars();
         let min = Infinity, max = -Infinity, n = 0;
+        if (a.cover && Number.isFinite(a.cover.from) && Number.isFinite(a.cover.to)) { min = a.cover.from; max = a.cover.to; n = 1; }
         for (let i = a.first; i <= a.last; i++) {
           const row = bars.valueAt(i);
           if (!row || row.length < 4) continue;
@@ -381,8 +384,8 @@ function findRGB(img, g, value) {
 // Pixels that are identical ink in both frames at zero shift belong to overlays that do not
 // scroll with the chart (grid lines, live price line, watermark, labels). They are excluded
 // from scoring, otherwise a correct shift still looks bad on a busy real chart.
-function staticMask(A, B) {
-  const a = A.g, b = B.g, n = a.length, bga = A.bg, bgb = B.bg, T = A.T;
+function staticMask(A, B, T = A.T) {
+  const a = A.g, b = B.g, n = a.length, bga = A.bg, bgb = B.bg;
   const m = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     const va = a[i], vb = b[i];
@@ -564,7 +567,10 @@ function findShiftWide(p, c, r) {
 }
 
 function findShift2D(p, c, r) {
-  if (!c.skip) { c.skip = staticMask(p, c); c.s4.skip = staticMask(p.s4, c.s4); }
+  if (!c.skip) {
+    c.skip = staticMask(p, c); c.s4.skip = staticMask(p.s4, c.s4);
+    c.skipLow = staticMask(p, c, 12); // faint overlays too (watermarks), for overlay removal
+  }
   const n4 = ((r.dxHi - r.dxLo) / 4 + 1) * ((r.dyHi - r.dyLo) / 4 + 1);
   const seed = n4 <= 4000
     ? grid(p.s4, c.s4, Math.floor(r.dxLo / 4), Math.ceil(r.dxHi / 4),
@@ -797,11 +803,11 @@ function makeStitcher() {
     X: 0, Y: 0, frames: 0, bgRGB: null,
     covTop: new Float64Array(COV_SIZE).fill(Infinity),
     covBot: new Float64Array(COV_SIZE).fill(-Infinity),
-    // TradingView logo watermark (canvas-drawn, bottom-left of the pane, no API switch):
-    // logoBox is found from the first two frames; each frame is drawn with that box cut out so
-    // the neighbouring frame supplies the real pixels, and the cut-outs are kept to fill any
-    // spot no other frame covers (so nothing is lost, only the repeated logo goes).
-    logoBox: undefined, pending: [], logoVotes: null, logoPairs: 0, logoCrops: [],
+    // Static overlays (TradingView logo, "Replay" watermark: canvas-drawn, no API switch):
+    // their boxes are found from the first frames; each frame is drawn with those boxes cut
+    // out so the neighbouring frame supplies the real pixels, and the cut-outs are kept to fill
+    // any spot no other frame covers (so nothing is lost, only the repeated overlay goes).
+    overlayBoxes: undefined, overlayMask: null, pending: [], overlayVotes: null, overlayPairs: 0, overlayCrops: [],
   };
 }
 
@@ -821,64 +827,77 @@ function wouldFit(st, f, X, Y) {
 }
 
 // Places frame f whose content moved by (dx, dy) relative to the previous accepted frame
-// Locate the logo from the static mask of two frames (pixels identical at zero shift): a dense
-// blob in the bottom-left corner, as opposed to grid/price lines that are 1-2 px thin.
-function findLogoBox(skip, w, h, k) {
-  if (!skip) return null;
-  const x1 = Math.round(w * 0.3), y0 = Math.max(0, Math.round(h - 70 * k)), y1 = Math.round(h - 4 * k);
-  // Grid lines are static too (vertical ones after a vertical move, horizontal ones after a
-  // horizontal move) but they continue outside the corner region; the logo does not.
-  const lineCol = new Uint8Array(x1), lineRow = new Uint8Array(h);
-  // (density, not a count: dotted lines crossing the strip add a pixel here and there too)
-  for (let x = 0; x < x1; x++) { let n = 0; for (let y = 0; y < y0; y++) if (skip[y * w + x]) n++; if (n > 0.08 * y0) lineCol[x] = 1; }
-  for (let y = y0; y < y1; y++) { let n = 0; for (let x = x1; x < w; x++) if (skip[y * w + x]) n++; if (n > 0.08 * (w - x1)) lineRow[y] = 1; }
-  const cols = new Uint16Array(x1);
-  for (let y = y0; y < y1; y++) { if (lineRow[y]) continue; for (let x = 0; x < x1; x++) if (!lineCol[x] && skip[y * w + x]) cols[x]++; }
-  const minC = Math.max(4, Math.round(5 * k)); // a thin line adds only 1-2 px per column
-  // Grow from the densest column over gaps no wider than the letter spacing, so a candle that
-  // happened to stand still somewhere else in the corner does not stretch the box.
-  let peak = -1;
-  for (let x = 0; x < x1; x++) if (peak < 0 || cols[x] > cols[peak]) peak = x;
-  if (peak < 0 || cols[peak] < minC) { if (traceCdp) console.log('[tvsc] logo: no column peak', peak, peak >= 0 ? cols[peak] : null, minC); return null; }
-  // thin letter strokes only reach 2-3 px per column; the icon-to-text gap is ~12 CSS px
-  const minG = Math.max(2, Math.round(2 * k)), gapX = Math.round(16 * k);
-  let bx0 = peak, bx1 = peak;
-  for (let x = peak - 1, gap = 0; x >= 0 && gap <= gapX; x--) { if (cols[x] >= minG) { bx0 = x; gap = 0; } else gap++; }
-  for (let x = peak + 1, gap = 0; x < x1 && gap <= gapX; x++) { if (cols[x] >= minG) { bx1 = x; gap = 0; } else gap++; }
-  const rowsN = new Uint16Array(h);
-  for (let y = y0; y < y1; y++) { if (lineRow[y]) continue; let n = 0; for (let x = bx0; x <= bx1; x++) if (!lineCol[x] && skip[y * w + x]) n++; rowsN[y] = n; }
-  let peakY = -1;
-  for (let y = y0; y < y1; y++) if (peakY < 0 || rowsN[y] > rowsN[peakY]) peakY = y;
-  if (peakY < 0 || rowsN[peakY] < minC) { if (traceCdp) console.log('[tvsc] logo: no row peak', peakY, bx0, bx1); return null; }
-  const gapY = Math.round(4 * k);
-  let by0 = peakY, by1 = peakY;
-  for (let y = peakY - 1, gap = 0; y >= y0 && gap <= gapY; y--) { if (rowsN[y] >= minG) { by0 = y; gap = 0; } else gap++; }
-  for (let y = peakY + 1, gap = 0; y < y1 && gap <= gapY; y++) { if (rowsN[y] >= minG) { by1 = y; gap = 0; } else gap++; }
-  if (by0 < 0) return null;
-  const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
-  if (bw < 40 * k || bw > 300 * k || bh < 8 * k || bh > 60 * k) { if (traceCdp) console.log('[tvsc] logo: bad shape', bx0, bx1, by0, by1); return null; } // not logo-shaped
-  const m = Math.round(3 * k);
-  return { x: Math.max(0, bx0 - m), y: Math.max(0, by0 - m), w: Math.min(w, bx1 + m + 1) - Math.max(0, bx0 - m), h: Math.min(h, by1 + m + 1) - Math.max(0, by0 - m) };
+const OVERLAY_PAIRS = 3; // frame pairs whose static masks vote before the overlay boxes are decided
+
+// Static overlays are things painted at a fixed place on the pane that scroll with nothing:
+// the TradingView logo, the "Replay" watermark, similar branding. They are found from the
+// low-contrast static mask voted over the first pairs; long thin runs (grid lines, price
+// lines, drawings that happen to be horizontal) are excluded, the rest is grouped into blobs.
+function findStaticOverlays(mask, w, h, k) {
+  const m = new Uint8Array(mask);
+  const gap = Math.round(6 * k);
+  // drop rows / columns that carry a long (gappy) run: lines
+  const longRun = (get, n) => {
+    let best = 0, run = 0, g = 0;
+    for (let i = 0; i < n; i++) {
+      if (get(i)) { run += g + 1; g = 0; if (run > best) best = run; }
+      else if (run) { if (++g > gap) { run = 0; g = 0; } }
+    }
+    return best;
+  };
+  for (let y = 0; y < h; y++) if (longRun((x) => m[y * w + x], w) > w * 0.5) m.fill(0, y * w, y * w + w);
+  for (let x = 0; x < w; x++) if (longRun((y) => m[y * w + x], h) > h * 0.5) for (let y = 0; y < h; y++) m[y * w + x] = 0;
+  // group nearby pixels (letters of one word) by labelling on a coarse grid
+  const cs = Math.max(2, Math.round(3 * k)), gw = Math.ceil(w / cs), gh = Math.ceil(h / cs);
+  const grid = new Uint8Array(gw * gh);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (m[y * w + x]) grid[Math.floor(y / cs) * gw + Math.floor(x / cs)] = 1;
+  const seen = new Uint8Array(gw * gh), boxes = [];
+  const stack = [];
+  for (let i = 0; i < grid.length; i++) {
+    if (!grid[i] || seen[i]) continue;
+    let x0 = gw, y0 = gh, x1 = -1, y1 = -1, cells = 0;
+    stack.push(i); seen[i] = 1;
+    while (stack.length) {
+      const j = stack.pop(), cx = j % gw, cy = (j - cx) / gw;
+      cells++;
+      if (cx < x0) x0 = cx; if (cx > x1) x1 = cx; if (cy < y0) y0 = cy; if (cy > y1) y1 = cy;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+        const q = ny * gw + nx;
+        if (grid[q] && !seen[q]) { seen[q] = 1; stack.push(q); }
+      }
+    }
+    const bw = (x1 - x0 + 1) * cs, bh = (y1 - y0 + 1) * cs;
+    if (bw < 30 * k || bh < 8 * k || bw > w * 0.5 || bh > h * 0.4 || cells < 12) continue;
+    const mg = Math.round(3 * k);
+    const bx = Math.max(0, x0 * cs - mg), by = Math.max(0, y0 * cs - mg);
+    boxes.push({ x: bx, y: by, w: Math.min(w, x1 * cs + cs + mg) - bx, h: Math.min(h, y1 * cs + cs + mg) - by });
+  }
+  boxes.sort((a, b) => b.w * b.h - a.w * a.h);
+  return boxes.slice(0, 8);
 }
 
-// Draw one frame into the stitch canvases, cutting the logo box out of the pane bitmap.
+// Draw one frame into the stitch canvases, cutting the overlay boxes out of the pane bitmap.
 async function drawFrame(st, f, X, Y) {
-  const box = st.logoBox;
-  if (box) {
-    // keep the cut-out only if something other than the logo is drawn there (candles, labels)
-    let other = 0;
-    for (let y = 0; y < box.h; y++) for (let x = 0; x < box.w; x++) {
-      if (st.logoMask[y * box.w + x]) continue;
-      const v = f.g[(box.y + y) * f.w + box.x + x];
-      if ((v > f.bg ? v - f.bg : f.bg - v) > f.T) other++;
-    }
-    if (other > Math.max(6, box.w * box.h * 0.01)) {
-      st.logoCrops.push({ bmp: await createImageBitmap(f.bmp, box.x, box.y, box.w, box.h), X: X + box.x, Y: Y + box.y });
-    }
+  const boxes = st.overlayBoxes;
+  if (boxes && boxes.length) {
     const c = new OffscreenCanvas(f.w, f.h);
     const ctx = c.getContext('2d');
     ctx.drawImage(f.bmp, 0, 0);
-    ctx.clearRect(box.x, box.y, box.w, box.h);
+    for (const box of boxes) {
+      // keep the cut-out only if something other than the overlay is drawn there (candles, labels)
+      let other = 0;
+      for (let y = 0; y < box.h; y++) for (let x = 0; x < box.w; x++) {
+        if (st.overlayMask[(box.y + y) * f.w + box.x + x]) continue;
+        const v = f.g[(box.y + y) * f.w + box.x + x];
+        if ((v > f.bg ? v - f.bg : f.bg - v) > f.T) other++;
+      }
+      if (other > Math.max(6, box.w * box.h * 0.01)) {
+        st.overlayCrops.push({ bmp: await createImageBitmap(f.bmp, box.x, box.y, box.w, box.h), X: X + box.x, Y: Y + box.y });
+      }
+      ctx.clearRect(box.x, box.y, box.w, box.h);
+    }
     const punched = c.transferToImageBitmap();
     st.main.draw(punched, X, Y);
     punched.close();
@@ -890,28 +909,21 @@ async function drawFrame(st, f, X, Y) {
   closeFrame(f); // pixels are now in the canvases; grey data stays for matching
 }
 
-const LOGO_PAIRS = 3; // frame pairs whose static masks vote before the logo box is decided
-
-// Decide the logo box from the accumulated votes and draw the frames held back so far.
-async function decideLogo(st) {
-  if (st.logoBox !== undefined) return;
-  let box = null;
-  if (st.logoVotes && st.logoPairs && st.pending.length) {
-    const need = 1; // any pair: candles may hide part of the logo in some frames
-    const mask = new Uint8Array(st.logoVotes.length);
-    for (let i = 0; i < mask.length; i++) if (st.logoVotes[i] >= need) mask[i] = 1;
+// Decide the overlay boxes from the accumulated votes and draw the frames held back so far.
+async function decideOverlays(st) {
+  if (st.overlayBoxes !== undefined) return;
+  let boxes = [];
+  if (st.overlayVotes && st.overlayPairs && st.pending.length) {
+    const need = Math.min(2, st.overlayPairs); // candles may hide part of an overlay in one pair
     const f0 = st.pending[0].f;
-    box = findLogoBox(mask, f0.w, f0.h, f0.k);
-    if (traceCdp) { let n = 0; for (let i = 0; i < mask.length; i++) n += mask[i]; console.log('[tvsc] logo votes', st.logoPairs, 'static px', n, 'frame', f0.w, f0.h, f0.k, 'box', JSON.stringify(box)); }
+    const mask = new Uint8Array(st.overlayVotes.length);
+    for (let i = 0; i < mask.length; i++) if (st.overlayVotes[i] >= need) mask[i] = 1;
+    boxes = findStaticOverlays(mask, f0.w, f0.h, f0.k);
+    st.overlayMask = mask;
+    if (traceCdp) console.log('[tvsc] overlays', JSON.stringify(boxes));
   }
-  st.logoBox = box;
-  if (box) {
-    // logo pixels inside the box (from the votes): a cut-out that holds nothing else is dropped
-    const f0 = st.pending[0].f, mask = new Uint8Array(box.w * box.h);
-    for (let y = 0; y < box.h; y++) for (let x = 0; x < box.w; x++) mask[y * box.w + x] = st.logoVotes[(box.y + y) * f0.w + box.x + x] ? 1 : 0;
-    st.logoMask = mask;
-  }
-  st.logoVotes = null;
+  st.overlayBoxes = boxes;
+  st.overlayVotes = null;
   const list = st.pending; st.pending = [];
   for (const pf of list) await drawFrame(st, pf.f, pf.X, pf.Y);
 }
@@ -926,14 +938,15 @@ async function accept(st, f, dx, dy) {
   }
   st.X = X; st.Y = Y; st.frames++;
   if (!st.bgRGB) st.bgRGB = f.bgRGB;
-  if (st.logoBox === undefined) {
-    // Hold the first frames back until enough pairs have voted on where the logo is.
+  if (st.overlayBoxes === undefined) {
+    // Hold the first frames back until enough pairs have voted on where the overlays are.
     st.pending.push({ f, X, Y });
-    if (f.skip && f.skip.length === f.w * f.h) {
-      if (!st.logoVotes) st.logoVotes = new Uint8Array(f.skip.length);
-      if (st.logoVotes.length === f.skip.length) { for (let i = 0; i < f.skip.length; i++) if (f.skip[i]) st.logoVotes[i]++; st.logoPairs++; }
+    const sk = f.skipLow;
+    if (sk && sk.length === f.w * f.h) {
+      if (!st.overlayVotes) st.overlayVotes = new Uint8Array(sk.length);
+      if (st.overlayVotes.length === sk.length) { for (let i = 0; i < sk.length; i++) if (sk[i]) st.overlayVotes[i]++; st.overlayPairs++; }
     }
-    if (st.logoPairs >= LOGO_PAIRS) await decideLogo(st);
+    if (st.overlayPairs >= OVERLAY_PAIRS) await decideOverlays(st);
     return true;
   }
   await drawFrame(st, f, X, Y);
@@ -942,7 +955,7 @@ async function accept(st, f, dx, dy) {
 
 // Frames still held back at the end (short captures) are decided and drawn now.
 async function flushPending(st) {
-  if (st.logoBox === undefined) await decideLogo(st);
+  if (st.overlayBoxes === undefined) await decideOverlays(st);
 }
 
 async function compose(st, includeAxis) {
@@ -953,10 +966,10 @@ async function compose(st, includeAxis) {
   const ctx = out.getContext('2d');
   const [r, g, bl] = st.bgRGB || [19, 23, 34];
   ctx.drawImage(st.main.c, b.x0 - st.main.ox, b.y0 - st.main.oy, W, Hm, 0, 0, W, Hm);
-  // Logo cut-outs go underneath: they only show where no frame supplied real pixels.
+  // Overlay cut-outs go underneath: they only show where no frame supplied real pixels.
   ctx.globalCompositeOperation = 'destination-over';
-  for (const c of st.logoCrops) { ctx.drawImage(c.bmp, c.X - b.x0, c.Y - b.y0); c.bmp.close(); }
-  st.logoCrops = [];
+  for (const c of st.overlayCrops) { ctx.drawImage(c.bmp, c.X - b.x0, c.Y - b.y0); c.bmp.close(); }
+  st.overlayCrops = [];
   ctx.fillStyle = `rgb(${r},${g},${bl})`;
   ctx.fillRect(0, 0, W + aw, Hm + hl);
   ctx.globalCompositeOperation = 'source-over';
@@ -1114,6 +1127,8 @@ async function run(mode, tabId, overrides) {
     const parkMouse = () => cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 });
     let hideLogged = false;
     const END_GAP = 3; // bars of empty space kept after the last candle when capturing toward present
+    // Vertical coverage guaranteed for every column: the price window the user started with.
+    const coverRange = useApi && probe.price ? { from: probe.price.from, to: probe.price.to } : null;
     let edgeHit = false; // set by move() when a horizontal move was clamped at a data edge
     const prep = async () => {
       if (!opts.hideOverlays) return;
@@ -1255,7 +1270,7 @@ async function run(mode, tabId, overrides) {
         let dyCss, arrow;
         if (useApi) {
           if (!newBars || newBars.first > newBars.last) return true;
-          const d = await execMain(tabId, pageApi, ['dataRange', newBars]).catch(() => null);
+          const d = await execMain(tabId, pageApi, ['dataRange', { ...newBars, cover: coverRange }]).catch(() => null);
           if (!d || !d.ok) return true;
           const below = d.yMin - d.paneH, above = -d.yMax; // px of candle outside the pane
           dlog('clip', { newBars, below: Math.round(below), above: Math.round(above), min: d.min, max: d.max, phase });
@@ -1507,7 +1522,7 @@ async function run(mode, tabId, overrides) {
     if (st && st.frames) {
       setStatus('stCompose');
       await flushPending(st);
-      dlog('logo', { box: st.logoBox });
+      dlog('overlays', { boxes: st.overlayBoxes });
       const out = await compose(st, opts.includeAxis);
       await putResult({ ...out, frames: st.frames, warnings, mode, createdAt: Date.now() });
       await chrome.tabs.create({ url: chrome.runtime.getURL('result.html') });

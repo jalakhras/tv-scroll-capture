@@ -107,3 +107,18 @@ with that box cleared, so with `destination-over` stitching the neighbouring fra
 the real pixels. The cut-out is kept and drawn underneath only when the frame has non-logo ink
 inside the box (candles under the logo) — otherwise the hole becomes background. Verified on
 light DPR 1 and dark DPR 1.25 (BTCUSD 15m, 15 frames): zero logos, no missing candles.
+
+## Follow-up (v1.3.5, owner's replay chart vs. the original: missing blue line, repeated "Replay")
+
+* A horizontal drawing at 83k sat inside the owner's initial price window but above the candles;
+  vertical tracking followed candles only, so most frames never covered its height and the line
+  appeared in fragments. Rule now: the price window at start is a guaranteed vertical coverage
+  for every column (`dataRange` takes `cover`), candles extend it. What the user could see at
+  start is captured along the whole width; zooming the price scale before starting is the way to
+  choose the vertical extent.
+* The "Replay" watermark is faint (below the ink threshold) so the logo mask never saw it. The
+  logo box became generic static-overlay boxes: a low-contrast static mask (T = 12) voted over
+  the first three pairs, long gappy runs removed (grid lines, price lines, horizontal drawings),
+  the rest grouped on a coarse grid into blobs (30×8 CSS px up to half the pane), cut out per
+  frame exactly like the logo. Cannot be exercised on an anonymous session (no Replay), so the
+  watermark case is inferred from the logo case, which passes on light DPR 1 and dark DPR 1.25.
