@@ -797,11 +797,21 @@ function makeStitcher() {
     X: 0, Y: 0, frames: 0, bgRGB: null,
     covTop: new Float64Array(COV_SIZE).fill(Infinity),
     covBot: new Float64Array(COV_SIZE).fill(-Infinity),
+    // TradingView logo watermark (canvas-drawn, bottom-left of the pane, no API switch):
+    // logoBox is found from the first two frames; each frame is drawn with that box cut out so
+    // the neighbouring frame supplies the real pixels, and the cut-outs are kept to fill any
+    // spot no other frame covers (so nothing is lost, only the repeated logo goes).
+    logoBox: undefined, pending: [], logoVotes: null, logoPairs: 0, logoCrops: [],
   };
 }
 
 function wouldFit(st, f, X, Y) {
-  const b = st.main.b;
+  let b = st.main.b;
+  for (const pf of st.pending) {
+    const q = { x0: pf.X, y0: pf.Y, x1: pf.X + pf.f.w, y1: pf.Y + pf.f.h };
+    b = b ? { x0: Math.min(b.x0, q.x0), y0: Math.min(b.y0, q.y0), x1: Math.max(b.x1, q.x1), y1: Math.max(b.y1, q.y1) } : q;
+  }
+  if (!b) return true;
   const x0 = Math.min(b.x0, X), x1 = Math.max(b.x1, X + f.w);
   const y0 = Math.min(b.y0, Y), y1 = Math.max(b.y1, Y + f.h);
   const W = x1 - x0 + (f.axis ? f.axis.width : 0);
@@ -811,12 +821,104 @@ function wouldFit(st, f, X, Y) {
 }
 
 // Places frame f whose content moved by (dx, dy) relative to the previous accepted frame
-function accept(st, f, dx, dy) {
-  const X = st.X - dx, Y = st.Y - dy;
-  if (st.frames && !wouldFit(st, f, X, Y)) return false;
-  st.main.draw(f.bmp, X, Y);
+// Locate the logo from the static mask of two frames (pixels identical at zero shift): a dense
+// blob in the bottom-left corner, as opposed to grid/price lines that are 1-2 px thin.
+function findLogoBox(skip, w, h, k) {
+  if (!skip) return null;
+  const x1 = Math.round(w * 0.3), y0 = Math.max(0, Math.round(h - 70 * k)), y1 = Math.round(h - 4 * k);
+  // Grid lines are static too (vertical ones after a vertical move, horizontal ones after a
+  // horizontal move) but they continue outside the corner region; the logo does not.
+  const lineCol = new Uint8Array(x1), lineRow = new Uint8Array(h);
+  // (density, not a count: dotted lines crossing the strip add a pixel here and there too)
+  for (let x = 0; x < x1; x++) { let n = 0; for (let y = 0; y < y0; y++) if (skip[y * w + x]) n++; if (n > 0.08 * y0) lineCol[x] = 1; }
+  for (let y = y0; y < y1; y++) { let n = 0; for (let x = x1; x < w; x++) if (skip[y * w + x]) n++; if (n > 0.08 * (w - x1)) lineRow[y] = 1; }
+  const cols = new Uint16Array(x1);
+  for (let y = y0; y < y1; y++) { if (lineRow[y]) continue; for (let x = 0; x < x1; x++) if (!lineCol[x] && skip[y * w + x]) cols[x]++; }
+  const minC = Math.max(4, Math.round(5 * k)); // a thin line adds only 1-2 px per column
+  // Grow from the densest column over gaps no wider than the letter spacing, so a candle that
+  // happened to stand still somewhere else in the corner does not stretch the box.
+  let peak = -1;
+  for (let x = 0; x < x1; x++) if (peak < 0 || cols[x] > cols[peak]) peak = x;
+  if (peak < 0 || cols[peak] < minC) { if (traceCdp) console.log('[tvsc] logo: no column peak', peak, peak >= 0 ? cols[peak] : null, minC); return null; }
+  // thin letter strokes only reach 2-3 px per column; the icon-to-text gap is ~12 CSS px
+  const minG = Math.max(2, Math.round(2 * k)), gapX = Math.round(16 * k);
+  let bx0 = peak, bx1 = peak;
+  for (let x = peak - 1, gap = 0; x >= 0 && gap <= gapX; x--) { if (cols[x] >= minG) { bx0 = x; gap = 0; } else gap++; }
+  for (let x = peak + 1, gap = 0; x < x1 && gap <= gapX; x++) { if (cols[x] >= minG) { bx1 = x; gap = 0; } else gap++; }
+  const rowsN = new Uint16Array(h);
+  for (let y = y0; y < y1; y++) { if (lineRow[y]) continue; let n = 0; for (let x = bx0; x <= bx1; x++) if (!lineCol[x] && skip[y * w + x]) n++; rowsN[y] = n; }
+  let peakY = -1;
+  for (let y = y0; y < y1; y++) if (peakY < 0 || rowsN[y] > rowsN[peakY]) peakY = y;
+  if (peakY < 0 || rowsN[peakY] < minC) { if (traceCdp) console.log('[tvsc] logo: no row peak', peakY, bx0, bx1); return null; }
+  const gapY = Math.round(4 * k);
+  let by0 = peakY, by1 = peakY;
+  for (let y = peakY - 1, gap = 0; y >= y0 && gap <= gapY; y--) { if (rowsN[y] >= minG) { by0 = y; gap = 0; } else gap++; }
+  for (let y = peakY + 1, gap = 0; y < y1 && gap <= gapY; y++) { if (rowsN[y] >= minG) { by1 = y; gap = 0; } else gap++; }
+  if (by0 < 0) return null;
+  const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+  if (bw < 40 * k || bw > 300 * k || bh < 8 * k || bh > 60 * k) { if (traceCdp) console.log('[tvsc] logo: bad shape', bx0, bx1, by0, by1); return null; } // not logo-shaped
+  const m = Math.round(3 * k);
+  return { x: Math.max(0, bx0 - m), y: Math.max(0, by0 - m), w: Math.min(w, bx1 + m + 1) - Math.max(0, bx0 - m), h: Math.min(h, by1 + m + 1) - Math.max(0, by0 - m) };
+}
+
+// Draw one frame into the stitch canvases, cutting the logo box out of the pane bitmap.
+async function drawFrame(st, f, X, Y) {
+  const box = st.logoBox;
+  if (box) {
+    // keep the cut-out only if something other than the logo is drawn there (candles, labels)
+    let other = 0;
+    for (let y = 0; y < box.h; y++) for (let x = 0; x < box.w; x++) {
+      if (st.logoMask[y * box.w + x]) continue;
+      const v = f.g[(box.y + y) * f.w + box.x + x];
+      if ((v > f.bg ? v - f.bg : f.bg - v) > f.T) other++;
+    }
+    if (other > Math.max(6, box.w * box.h * 0.01)) {
+      st.logoCrops.push({ bmp: await createImageBitmap(f.bmp, box.x, box.y, box.w, box.h), X: X + box.x, Y: Y + box.y });
+    }
+    const c = new OffscreenCanvas(f.w, f.h);
+    const ctx = c.getContext('2d');
+    ctx.drawImage(f.bmp, 0, 0);
+    ctx.clearRect(box.x, box.y, box.w, box.h);
+    const punched = c.transferToImageBitmap();
+    st.main.draw(punched, X, Y);
+    punched.close();
+  } else {
+    st.main.draw(f.bmp, X, Y);
+  }
   if (f.axis) st.axis.draw(f.axis, 0, Y);
   if (f.lower) st.lower.draw(f.lower, X, 0);
+  closeFrame(f); // pixels are now in the canvases; grey data stays for matching
+}
+
+const LOGO_PAIRS = 3; // frame pairs whose static masks vote before the logo box is decided
+
+// Decide the logo box from the accumulated votes and draw the frames held back so far.
+async function decideLogo(st) {
+  if (st.logoBox !== undefined) return;
+  let box = null;
+  if (st.logoVotes && st.logoPairs && st.pending.length) {
+    const need = 1; // any pair: candles may hide part of the logo in some frames
+    const mask = new Uint8Array(st.logoVotes.length);
+    for (let i = 0; i < mask.length; i++) if (st.logoVotes[i] >= need) mask[i] = 1;
+    const f0 = st.pending[0].f;
+    box = findLogoBox(mask, f0.w, f0.h, f0.k);
+    if (traceCdp) { let n = 0; for (let i = 0; i < mask.length; i++) n += mask[i]; console.log('[tvsc] logo votes', st.logoPairs, 'static px', n, 'frame', f0.w, f0.h, f0.k, 'box', JSON.stringify(box)); }
+  }
+  st.logoBox = box;
+  if (box) {
+    // logo pixels inside the box (from the votes): a cut-out that holds nothing else is dropped
+    const f0 = st.pending[0].f, mask = new Uint8Array(box.w * box.h);
+    for (let y = 0; y < box.h; y++) for (let x = 0; x < box.w; x++) mask[y * box.w + x] = st.logoVotes[(box.y + y) * f0.w + box.x + x] ? 1 : 0;
+    st.logoMask = mask;
+  }
+  st.logoVotes = null;
+  const list = st.pending; st.pending = [];
+  for (const pf of list) await drawFrame(st, pf.f, pf.X, pf.Y);
+}
+
+async function accept(st, f, dx, dy) {
+  const X = st.X - dx, Y = st.Y - dy;
+  if (st.frames && !wouldFit(st, f, X, Y)) return false;
   for (let x = 0; x < f.w; x++) {
     const i = X + x + COV_OFF;
     if (Y < st.covTop[i]) st.covTop[i] = Y;
@@ -824,8 +926,23 @@ function accept(st, f, dx, dy) {
   }
   st.X = X; st.Y = Y; st.frames++;
   if (!st.bgRGB) st.bgRGB = f.bgRGB;
-  closeFrame(f); // pixels are now in the canvases; grey data stays for matching
+  if (st.logoBox === undefined) {
+    // Hold the first frames back until enough pairs have voted on where the logo is.
+    st.pending.push({ f, X, Y });
+    if (f.skip && f.skip.length === f.w * f.h) {
+      if (!st.logoVotes) st.logoVotes = new Uint8Array(f.skip.length);
+      if (st.logoVotes.length === f.skip.length) { for (let i = 0; i < f.skip.length; i++) if (f.skip[i]) st.logoVotes[i]++; st.logoPairs++; }
+    }
+    if (st.logoPairs >= LOGO_PAIRS) await decideLogo(st);
+    return true;
+  }
+  await drawFrame(st, f, X, Y);
   return true;
+}
+
+// Frames still held back at the end (short captures) are decided and drawn now.
+async function flushPending(st) {
+  if (st.logoBox === undefined) await decideLogo(st);
 }
 
 async function compose(st, includeAxis) {
@@ -835,9 +952,14 @@ async function compose(st, includeAxis) {
   const out = new OffscreenCanvas(W + aw, Hm + hl);
   const ctx = out.getContext('2d');
   const [r, g, bl] = st.bgRGB || [19, 23, 34];
+  ctx.drawImage(st.main.c, b.x0 - st.main.ox, b.y0 - st.main.oy, W, Hm, 0, 0, W, Hm);
+  // Logo cut-outs go underneath: they only show where no frame supplied real pixels.
+  ctx.globalCompositeOperation = 'destination-over';
+  for (const c of st.logoCrops) { ctx.drawImage(c.bmp, c.X - b.x0, c.Y - b.y0); c.bmp.close(); }
+  st.logoCrops = [];
   ctx.fillStyle = `rgb(${r},${g},${bl})`;
   ctx.fillRect(0, 0, W + aw, Hm + hl);
-  ctx.drawImage(st.main.c, b.x0 - st.main.ox, b.y0 - st.main.oy, W, Hm, 0, 0, W, Hm);
+  ctx.globalCompositeOperation = 'source-over';
   if (aw) ctx.drawImage(st.axis.c, st.axis.b.x0 - st.axis.ox, b.y0 - st.axis.oy, aw, Hm, W, 0, aw, Hm);
   if (hl) ctx.drawImage(st.lower.c, b.x0 - st.lower.ox, st.lower.b.y0 - st.lower.oy, W, hl, 0, Hm, W, hl);
   return { blob: await out.convertToBlob({ type: 'image/png' }), width: W + aw, height: Hm + hl };
@@ -916,7 +1038,7 @@ async function run(mode, tabId, overrides) {
   let attached = false, st = null, prev = null;
   const progress = () => {
     const b = st.main.b;
-    state.frames = st.frames; state.widthPx = b.x1 - b.x0; state.heightPx = b.y1 - b.y0;
+    state.frames = st.frames; state.widthPx = b ? b.x1 - b.x0 : 0; state.heightPx = b ? b.y1 - b.y0 : 0;
   };
 
   let api0 = null; // chart state before we touched it (restored in finally)
@@ -1074,14 +1196,14 @@ async function run(mode, tabId, overrides) {
 
     st = makeStitcher();
     prev = await grabS('frame 0 (base)');
-    accept(st, prev, 0, 0);
+    await accept(st, prev, 0, 0);
     progress();
 
     const k = prev.k;
     const tol = Math.round(8 * k);
 
-    const tryAccept = (cur, m) => {
-      if (!accept(st, cur, m.dx, m.dy)) {
+    const tryAccept = async (cur, m) => {
+      if (!(await accept(st, cur, m.dx, m.dy))) {
         warn('cap', 'wCap');
         closeFrame(cur);
         return false;
@@ -1188,7 +1310,7 @@ async function run(mode, tabId, overrides) {
           await settle();
           return true;
         } else if (Math.abs(m.dy) < Math.abs(exp) * 0.2) { closeFrame(cur); return true; }
-        if (!tryAccept(cur, m)) return false;
+        if (!(await tryAccept(cur, m))) return false;
       }
       if (useApi) warn('maxvert', 'wMaxVert');
       else { const clip = clipInfo(prev, st); if (clip.top || clip.bottom) warn('maxvert', 'wMaxVert'); }
@@ -1233,7 +1355,7 @@ async function run(mode, tabId, overrides) {
           await settle();
           return true;
         }
-        return tryAccept(cur, m);
+        return await tryAccept(cur, m);
       };
 
       for (let i = 1; i <= opts.steps && ok && !state.stop; i++) {
@@ -1327,7 +1449,7 @@ async function run(mode, tabId, overrides) {
           continue;
         }
         stalls = 0;
-        if (!tryAccept(cur, m)) break;
+        if (!(await tryAccept(cur, m))) break;
         ok = await trackVertical(newBars);
         if (atEnd) { warn('end', 'wEndReached'); break; }
       }
@@ -1352,7 +1474,7 @@ async function run(mode, tabId, overrides) {
           continue;
         }
         if (Math.abs(m.dx) < 2 && Math.abs(m.dy) < 2) { closeFrame(cur); continue; }
-        if (!tryAccept(cur, m)) break;
+        if (!(await tryAccept(cur, m))) break;
       }
     }
   } catch (e) {
@@ -1384,6 +1506,8 @@ async function run(mode, tabId, overrides) {
   try {
     if (st && st.frames) {
       setStatus('stCompose');
+      await flushPending(st);
+      dlog('logo', { box: st.logoBox });
       const out = await compose(st, opts.includeAxis);
       await putResult({ ...out, frames: st.frames, warnings, mode, createdAt: Date.now() });
       await chrome.tabs.create({ url: chrome.runtime.getURL('result.html') });

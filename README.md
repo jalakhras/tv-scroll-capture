@@ -47,8 +47,10 @@ repainting and the capture pauses with a warning.
 * Chrome shows the “TV Scroll Capture started debugging this browser” bar while a capture runs;
   the extension uses the DevTools protocol for screenshots. Closing the bar stops the capture
   and keeps what was captured.
-* The TradingView logo watermark is drawn on the chart canvas and cannot be hidden; it repeats
-  at the bottom-left of each vertical window.
+* The TradingView logo watermark is drawn on the chart canvas and has no switch. The extension
+  locates it from the first frames and cuts it out of every frame so the neighbouring frame
+  supplies the real pixels underneath; a cut-out is kept only where nothing else covers that
+  spot *and* candles lie under the logo, so no chart content is ever lost.
 * Nothing leaves your machine: no network requests, the result is stored in IndexedDB.
 
 ## Development
@@ -102,7 +104,9 @@ the v1.3 design. Run `node --check *.js` before committing.
 
 * يظهر شريط «TV Scroll Capture بدأ تصحيح هذا المتصفح» أثناء الالتقاط لأن الإضافة تستخدم
   بروتوكول DevTools للقطات. إغلاقه يوقف الالتقاط ويحفظ ما التُقط.
-* شعار TradingView مرسوم على canvas الشارت ولا يمكن إخفاؤه؛ يتكرر أسفل يسار كل نافذة عمودية.
+* شعار TradingView مرسوم على canvas الشارت ولا مفتاح لإخفائه. تحدّد الإضافة موضعه من الإطارات
+  الأولى وتقصّه من كل إطار ليملأ الإطار المجاور ما تحته بالمحتوى الحقيقي؛ ولا تُبقي قصاصته إلا حيث
+  لا يغطي المكان إطار آخر **و**توجد شموع تحت الشعار، فلا يُفقد أي محتوى.
 * لا يغادر شيء جهازك: لا طلبات شبكة، والنتيجة تُحفظ في IndexedDB.
 
 ## التطوير

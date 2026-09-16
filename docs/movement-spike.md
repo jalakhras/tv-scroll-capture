@@ -96,3 +96,14 @@ bars kept after the last candle) and the run ends with `wEndReached`. Verified: 
 ~1200 bars back toward present (30 frames, ends 3 bars after the last candle) and ARM 1D into
 the past down to the IPO bar (8 frames). `visibleBarsStrictRange()` returns *logical* indices,
 so it cannot be used to detect the edge by itself.
+
+## Follow-up (v1.3.4, the repeated TradingView logo)
+
+No property, feature toggle or widget option hides the canvas logo (`showLogo` is the legend's).
+It is removed at stitch time instead: the static masks of the first three frame pairs vote for
+pixels that never move; the densest blob in the bottom-left corner (grid lines excluded by their
+density outside the corner; growth over letter-sized gaps) is the logo box. Every frame is drawn
+with that box cleared, so with `destination-over` stitching the neighbouring frame fills it with
+the real pixels. The cut-out is kept and drawn underneath only when the frame has non-logo ink
+inside the box (candles under the logo) — otherwise the hole becomes background. Verified on
+light DPR 1 and dark DPR 1.25 (BTCUSD 15m, 15 frames): zero logos, no missing candles.
