@@ -55,8 +55,7 @@ repainting and the capture pauses with a warning.
 
 ## Development
 
-Plain ES modules, no bundler. `SPEC.md` (Arabic) is the requirements document;
-`docs/movement-spike.md` records the diagnosis of the v1.2 failure and the evidence behind
-the v1.3 design. Run `node --check *.js` before committing.
+Plain ES modules, no bundler. `docs/movement-spike.md` records the diagnosis of the v1.2
+failure and the evidence behind the v1.3 design. Run `node --check *.js` before committing.
 
 ---
